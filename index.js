@@ -56,6 +56,7 @@ async function run() {
         const userCollection = db.collection("users")
         const roomCollection = db.collection("rooms")
         const bookingCollection = db.collection("bookings")
+        const categoryAndPricingCollection = db.collection("category&pricing")
 
 
         // jwt verify
@@ -81,7 +82,7 @@ async function run() {
                         req.decodedEmail = payload.email
                         return next()
                     }
-                } catch (e) {}
+                } catch (e) { }
                 return res.status(403).send({ message: "Unauthorized Access" })
             }
         }
@@ -227,7 +228,7 @@ async function run() {
             const query = { _id: new ObjectId(id) }
             // get the room to find all cloudinary public_ids before deleting
             const room = await roomCollection.findOne(query)
-            
+
             // Delete all images associated with this room
             const publicIdsToDelete = []
             if (room?.imagePublicId) publicIdsToDelete.push(room.imagePublicId)
@@ -264,7 +265,7 @@ async function run() {
             if (roomId) {
                 try {
                     roomFilter = { $or: [{ roomId: roomId }, { _id: new ObjectId(roomId) }] }
-                } catch(e) {
+                } catch (e) {
                     roomFilter = { roomId: roomId }
                 }
             } else if (roomCategory) {
@@ -402,6 +403,27 @@ async function run() {
             const { id } = req.params
             const query = { _id: new ObjectId(id) }
             const result = await bookingCollection.deleteOne(query)
+            res.send(result)
+        })
+        // category and pricing 
+        app.get("/categoryandpricing", async (req, res) => {
+            const result = await categoryAndPricingCollection.find().toArray()
+            res.send(result)
+        })
+        app.patch("/categoryandpricing/:id", async (req, res) => {
+            const { id } = req.query
+            const data = req.body
+            data.updatedAt = new Date()
+            const query = { _id: new ObjectId(id) }
+            const update = { $set: data }
+            const result = await categoryAndPricingCollection.updateOne(query, update)
+            res.send(result)
+        })
+        app.post("/categoryandpricing", async (req, res) => {
+            const data = req.body
+            date.createdAt = new Date()
+            data.updatedAt = new Date()
+            const result = await categoryAndPricingCollection.insertOne()
             res.send(result)
         })
 
