@@ -411,7 +411,7 @@ async function run() {
             res.send(result)
         })
         app.patch("/categoryandpricing/:id", async (req, res) => {
-            const { id } = req.query
+            const { id } = req.params
             const data = req.body
             data.updatedAt = new Date()
             const query = { _id: new ObjectId(id) }
@@ -421,9 +421,15 @@ async function run() {
         })
         app.post("/categoryandpricing", async (req, res) => {
             const data = req.body
-            date.createdAt = new Date()
+            data.createdAt = new Date()
             data.updatedAt = new Date()
-            const result = await categoryAndPricingCollection.insertOne()
+            const result = await categoryAndPricingCollection.insertOne(data)
+            res.send(result)
+        })
+        app.delete('/categoryandpricing/:id', async (req, res) => {
+            const { id } = req.params
+            const query = { _id: new ObjectId(id) }
+            const result  = await categoryAndPricingCollection.deleteOne(query)
             res.send(result)
         })
 
@@ -450,7 +456,7 @@ async function run() {
                         { $limit: 7 }
                     ],
                     bookingsPerRoom: [
-                        { $group: { _id: "$roomCategory", count: { $sum: 1 } } },
+                        { $group: { _id: { $ifNull: ["$roomName", "$roomCategory"] }, count: { $sum: 1 } } },
                         { $sort: { count: -1 } }
                     ]
                 }
