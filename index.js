@@ -49,6 +49,24 @@ const client = new MongoClient(uri, {
     }
 })
 
+const generateBookingId = () => {
+    const today = new Date()
+    const date = today.toISOString().split("T")[0].replaceAll("-", "")
+    const random = Math.random().toString(36).slice(2, 8).toUpperCase()
+    return `BK-${date}-${random}`
+}
+
+const ensureBookingIdIndex = async (bookingCollection) => {
+    const indexes = await bookingCollection.indexes()
+    const bookingIdIndex = indexes.find(index => index.key?.bookingId === 1)
+
+    if (bookingIdIndex?.unique) {
+        return
+    }
+
+    await bookingCollection.createIndex({ bookingId: 1 }, { unique: true })
+}
+
 async function run() {
     try {
         const db = client.db("miami_beach_resort_db")
@@ -58,6 +76,7 @@ async function run() {
         const bookingCollection = db.collection("bookings")
         const categoryAndPricingCollection = db.collection("category&pricing")
 
+        await ensureBookingIdIndex(bookingCollection)
 
         // jwt verify
         const verifyFBToken = async (req, res, next) => {
@@ -341,18 +360,26 @@ async function run() {
             }
 
             const today = new Date()
-            const date = today.toISOString().split("T")[0].replaceAll("-", "")
-            const random = Math.random().toString(36).slice(2, 8).toUpperCase()
-            const bookingId = `BK-${date}-${random}`
+            const bookingData = {
+                ...data,
+                createdAt: today,
+                status: "pending",
+                statusHistory: [{ status: "pending", time: today }]
+            }
 
-            data.bookingId = bookingId
-            data.createdAt = today
-            data.status = "pending"
-            data.statusHistory = [{ status: "pending", time: today }]
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                const bookingId = generateBookingId()
 
-            const result = await bookingCollection.insertOne(data)
-            result.bookingId = bookingId
-            res.send(result)
+                try {
+                    const result = await bookingCollection.insertOne({ ...bookingData, bookingId })
+                    result.bookingId = bookingId
+                    return res.send(result)
+                } catch (error) {
+                    if (error.code !== 11000 || attempt === 5) {
+                        throw error
+                    }
+                }
+            }
         })
 
         app.get("/bookings", verifyFBToken, async (req, res) => {
