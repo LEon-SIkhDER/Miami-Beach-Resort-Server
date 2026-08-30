@@ -4,6 +4,7 @@ app.use(express.json())
 const cors = require("cors")
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb')
 const cloudinary = require('cloudinary').v2
+const cron = require("node-cron")
 require('dotenv').config()
 const dns = require("dns")
 
@@ -56,6 +57,34 @@ const generateBookingId = () => {
     return `BK-${date}-${random}`
 }
 
+const BOOKING_STATUS = {
+    REQUEST_BOOKING: "request_booking",
+    PAYMENT_WAITING: "payment_waiting",
+    BOOKING_CONFIRMED: "booking_confirmed",
+    CHECKED_IN: "checked_id",
+    CHECKED_OUT: "checked_out",
+    CANCEL: "cancel"
+}
+
+const ACTIVE_BOOKING_STATUSES = [
+    BOOKING_STATUS.REQUEST_BOOKING,
+    BOOKING_STATUS.PAYMENT_WAITING,
+    BOOKING_STATUS.BOOKING_CONFIRMED,
+    BOOKING_STATUS.CHECKED_IN,
+    "pending",
+    "confirmed"
+]
+
+const REQUEST_BOOKING_EXPIRE_HOURS_BY_ROLE = {
+    user: 1,
+    admin: 1,
+    default: 1
+}
+
+const getRequestBookingExpireHours = (role = "default") => {
+    return REQUEST_BOOKING_EXPIRE_HOURS_BY_ROLE[role] || REQUEST_BOOKING_EXPIRE_HOURS_BY_ROLE.default
+}
+
 const ensureBookingIdIndex = async (bookingCollection) => {
     const indexes = await bookingCollection.indexes()
     const bookingIdIndex = indexes.find(index => index.key?.bookingId === 1)
@@ -67,6 +96,193 @@ const ensureBookingIdIndex = async (bookingCollection) => {
     await bookingCollection.createIndex({ bookingId: 1 }, { unique: true })
 }
 
+const toObjectId = (value) => {
+    try {
+        return ObjectId.isValid(value) ? new ObjectId(value) : null
+    } catch (_) {
+        return null
+    }
+}
+
+const getNightCount = (checkIn, checkOut) => {
+    const nights = Math.ceil((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24))
+    return nights > 0 ? nights : 0
+}
+
+const getBookingRooms = (booking = {}) => {
+    if (Array.isArray(booking.rooms) && booking.rooms.length) {
+        return booking.rooms
+    }
+
+    if (!booking.roomId && !booking.checkIn && !booking.checkOut) {
+        return []
+    }
+
+    return [{
+        roomId: booking.roomId,
+        categoryId: booking.categoryId,
+        checkIn: booking.checkIn,
+        checkOut: booking.checkOut,
+        adults: Number(booking.adults || 1),
+        babies: Number(booking.babies || 0),
+        pricePerNight: Number(booking.pricePerNight || booking.price || 0),
+        room: {
+            name: booking.roomName,
+            category: booking.roomCategory
+        }
+    }]
+}
+
+const normalizeBookingRooms = (data = {}) => {
+    const rawRooms = Array.isArray(data.rooms) && data.rooms.length
+        ? data.rooms
+        : [{
+            roomId: data.roomId || data.categoryId,
+            categoryId: data.categoryId,
+            categoryName: data.categoryName,
+            roomNo: data.roomNo,
+            checkIn: data.checkIn,
+            checkOut: data.checkOut,
+            adults: data.adults,
+            babies: data.babies,
+            pricePerNight: data.pricePerNight || data.price
+        }]
+
+    return rawRooms.map(room => ({
+        roomId: String(room.roomId || room.categoryId || ""),
+        categoryId: room.categoryId ? String(room.categoryId) : (room.roomId ? String(room.roomId) : ""),
+        categoryName: room.categoryName || "",
+        roomNo: room.roomNo || "",
+        checkIn: room.checkIn,
+        checkOut: room.checkOut,
+        adults: Number(room.adults || 1),
+        babies: Number(room.babies || 0),
+        pricePerNight: Number(room.pricePerNight || 0)
+    }))
+}
+
+const getRoomTotal = (room = {}) => {
+    return getNightCount(room.checkIn, room.checkOut) * Number(room.pricePerNight || 0)
+}
+
+const getBookingTotal = (booking = {}) => {
+    const rooms = getBookingRooms(booking)
+    if (rooms.length) {
+        const total = rooms.reduce((sum, room) => sum + getRoomTotal(room), 0)
+        return total || Number(booking.totalAmount || 0)
+    }
+    return Number(booking.totalAmount || 0)
+}
+
+const getRoomIdsForLookup = (bookings = []) => {
+    return [...new Set(bookings.flatMap(booking => getBookingRooms(booking).map(room => room.roomId).filter(Boolean)))]
+}
+
+const hydrateBookingsWithRooms = async (bookings = [], roomCollection) => {
+    const roomIds = getRoomIdsForLookup(bookings)
+    const objectIds = roomIds.map(toObjectId).filter(Boolean)
+    const roomDocs = objectIds.length
+        ? await roomCollection.find({ _id: { $in: objectIds } }).toArray()
+        : []
+    const roomMap = new Map(roomDocs.map(room => [String(room._id), room]))
+
+    return bookings.map(booking => {
+        const rooms = getBookingRooms(booking).map(room => ({
+            ...room,
+            room: roomMap.get(String(room.roomId)) || room.room || null
+        }))
+        return {
+            ...booking,
+            rooms,
+            calculatedTotalAmount: getBookingTotal({ ...booking, rooms })
+        }
+    })
+}
+
+const findRoomConflict = async (bookingCollection, room) => {
+    const roomId = String(room.roomId || "")
+    const objectId = toObjectId(roomId)
+    const legacyRoomFilters = [{ roomId }]
+    if (objectId) legacyRoomFilters.push({ roomId: objectId })
+
+    return bookingCollection.findOne({
+        status: { $in: ACTIVE_BOOKING_STATUSES },
+        $or: [
+            {
+                rooms: {
+                    $elemMatch: {
+                        roomId,
+                        checkIn: { $lt: room.checkOut },
+                        checkOut: { $gt: room.checkIn }
+                    }
+                }
+            },
+            {
+                $and: [
+                    { $or: legacyRoomFilters },
+                    { checkIn: { $lt: room.checkOut } },
+                    { checkOut: { $gt: room.checkIn } }
+                ]
+            }
+        ]
+    })
+}
+
+const validateBookingRooms = (rooms = []) => {
+    if (!rooms.length) return "At least one room is required"
+
+    for (const room of rooms) {
+        if (!room.roomId && !room.categoryId) return "Room or Category is required"
+        if (!room.checkIn || !room.checkOut) return "Check-in and Check-out dates are required for every room"
+        if (new Date(room.checkOut) <= new Date(room.checkIn)) return "Check-out date must be after check-in date"
+        if (Number(room.adults || 0) < 1) return "Every room needs at least one adult"
+    }
+
+    for (let i = 0; i < rooms.length; i++) {
+        for (let j = i + 1; j < rooms.length; j++) {
+            const first = rooms[i]
+            const second = rooms[j]
+            // Only block if a specific physical roomNo is specified and identical for overlapping dates
+            if (first.roomNo && second.roomNo && first.roomNo === second.roomNo && first.checkIn < second.checkOut && first.checkOut > second.checkIn) {
+                return `Room ${first.roomNo} cannot be selected twice for overlapping dates`
+            }
+        }
+    }
+
+    return ""
+}
+
+const startRequestBookingAutoCancelJob = (bookingCollection) => {
+    cron.schedule("* * * * *", async () => {
+        const now = new Date()
+
+        try {
+            await bookingCollection.updateMany(
+                {
+                    status: BOOKING_STATUS.REQUEST_BOOKING,
+                    requestExpiresAt: { $lte: now }
+                },
+                {
+                    $set: {
+                        status: BOOKING_STATUS.CANCEL,
+                        cancelledAt: now,
+                        cancelReason: "Request booking expired after waiting time"
+                    },
+                    $push: {
+                        statusHistory: {
+                            status: BOOKING_STATUS.CANCEL,
+                            time: now,
+                            note: "Auto cancelled by cron after request booking expired"
+                        }
+                    }
+                }
+            )
+        } catch (error) {
+            console.log("Request booking auto cancel error:", error.message)
+        }
+    })
+}
+
 async function run() {
     try {
         const db = client.db("miami_beach_resort_db")
@@ -74,9 +290,10 @@ async function run() {
         const userCollection = db.collection("users")
         const roomCollection = db.collection("rooms")
         const bookingCollection = db.collection("bookings")
-        const categoryAndPricingCollection = db.collection("category&pricing")
+        const categoryAndRoomCollection = db.collection("categoryandroom")
 
         await ensureBookingIdIndex(bookingCollection)
+        startRequestBookingAutoCancelJob(bookingCollection)
 
         // jwt verify
         const verifyFBToken = async (req, res, next) => {
@@ -221,8 +438,14 @@ async function run() {
 
         app.get("/room/:id", async (req, res) => {
             const { id } = req.params
-            const query = { _id: new ObjectId(id) }
-            const result = await roomCollection.findOne(query)
+            const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
+            let result = await categoryAndRoomCollection.findOne(query)
+            if (!result) {
+                result = await roomCollection.findOne(query)
+            }
+            if (!result) {
+                return res.status(404).send({ message: "Room or Category not found" })
+            }
             res.send(result)
         })
 
@@ -277,34 +500,24 @@ async function run() {
         // BOOKING RELATED CODES ..............................................
         // Check live room availability for specific dates
         app.get("/check-room-availability", async (req, res) => {
-            const { roomId, roomCategory, checkIn, checkOut } = req.query
+            const { roomId, checkIn, checkOut } = req.query
             if (!checkIn || !checkOut) {
                 return res.status(400).send({ available: false, message: "Check-in and Check-out dates are required" })
             }
-
-            let roomFilter = {}
-            if (roomId) {
-                try {
-                    roomFilter = { $or: [{ roomId: roomId }, { _id: new ObjectId(roomId) }] }
-                } catch (e) {
-                    roomFilter = { roomId: roomId }
-                }
-            } else if (roomCategory) {
-                roomFilter = { roomCategory: roomCategory }
+            if (!roomId) {
+                return res.status(400).send({ available: false, message: "Room is required" })
             }
 
-            const conflictQuery = {
-                status: { $in: ["pending", "confirmed"] },
-                ...roomFilter,
-                checkIn: { $lt: checkOut },
-                checkOut: { $gt: checkIn }
-            }
-
-            const existingBooking = await bookingCollection.findOne(conflictQuery)
+            const existingBooking = await findRoomConflict(bookingCollection, { roomId, checkIn, checkOut })
             if (existingBooking) {
+                const conflictingRoom = getBookingRooms(existingBooking).find(room =>
+                    String(room.roomId) === String(roomId) &&
+                    room.checkIn < checkOut &&
+                    room.checkOut > checkIn
+                )
                 return res.send({
                     available: false,
-                    message: `Room is already reserved from ${existingBooking.checkIn} to ${existingBooking.checkOut}. Please select different dates or another room.`,
+                    message: `Room is already reserved from ${conflictingRoom?.checkIn || existingBooking.checkIn} to ${conflictingRoom?.checkOut || existingBooking.checkOut}. Please select different dates or another room.`,
                     conflict: existingBooking
                 })
             }
@@ -313,58 +526,114 @@ async function run() {
         // Get all active reserved date ranges for rooms (for calendar / availability preview)
         app.get("/bookings/reserved-dates", async (req, res) => {
             const { roomId } = req.query
-            const query = { status: { $in: ["pending", "confirmed"] } }
+            const query = {
+                status: { $in: ACTIVE_BOOKING_STATUSES }
+            }
             if (roomId) {
-                query.roomId = roomId
+                query.$or = [
+                    { roomId },
+                    { "rooms.roomId": roomId }
+                ]
             }
-            const options = {
-                projection: { roomId: 1, roomName: 1, roomCategory: 1, checkIn: 1, checkOut: 1, status: 1, _id: 0 }
-            }
-            const result = await bookingCollection.find(query, options).toArray()
+            const bookings = await bookingCollection.find(query).toArray()
+            const result = bookings.flatMap(booking =>
+                getBookingRooms(booking)
+                    .filter(room => !roomId || String(room.roomId) === String(roomId))
+                    .map(room => ({
+                        bookingId: booking.bookingId,
+                        roomId: room.roomId,
+                        checkIn: room.checkIn,
+                        checkOut: room.checkOut,
+                        status: booking.status
+                    }))
+            )
             res.send(result)
         })
 
         app.post("/bookings", async (req, res) => {
             const data = req.body
-            const { roomId, roomCategory, checkIn, checkOut } = data
+            const rooms = normalizeBookingRooms(data)
+            const validationError = validateBookingRooms(rooms)
 
-            if (!checkIn || !checkOut) {
-                return res.status(400).send({ message: "Check-in and Check-out dates are required" })
+            if (validationError) {
+                return res.status(400).send({ message: validationError })
             }
 
-            if (new Date(checkOut) <= new Date(checkIn)) {
-                return res.status(400).send({ message: "Check-out date must be after check-in date" })
-            }
+            for (const room of rooms) {
+                const targetCategoryId = room.categoryId || room.roomId
+                const catObjectId = toObjectId(targetCategoryId)
+                const category = catObjectId ? await categoryAndRoomCollection.findOne({ _id: catObjectId }) : null
 
-            // Check for date collision on the same room
-            let roomFilter = {}
-            if (roomId) {
-                roomFilter = { $or: [{ roomId: roomId }, { _id: new ObjectId(roomId) }] }
-            } else if (roomCategory) {
-                roomFilter = { roomCategory: roomCategory }
-            }
+                if (category && Array.isArray(category.roomNumbers) && category.roomNumbers.length > 0) {
+                    const totalCategoryRooms = category.roomNumbers.length
 
-            const conflictQuery = {
-                status: { $in: ["pending", "confirmed"] },
-                ...roomFilter,
-                checkIn: { $lt: checkOut },
-                checkOut: { $gt: checkIn }
-            }
+                    // Count how many rooms in this request are for this category and overlapping dates
+                    const requestedCount = rooms.filter(r => 
+                        (r.categoryId === targetCategoryId || r.roomId === targetCategoryId) &&
+                        r.checkIn < room.checkOut &&
+                        r.checkOut > room.checkIn
+                    ).length
 
-            const existingBooking = await bookingCollection.findOne(conflictQuery)
-            if (existingBooking) {
-                return res.status(409).send({
-                    message: `Room is already reserved from ${existingBooking.checkIn} to ${existingBooking.checkOut}. Please select different dates or another room.`,
-                    conflictBookingId: existingBooking.bookingId
-                })
+                    // Count how many active bookings exist for this category and overlapping dates
+                    const activeBookings = await bookingCollection.find({
+                        status: { $in: ACTIVE_BOOKING_STATUSES },
+                        $or: [
+                            { "rooms.categoryId": targetCategoryId, "rooms.checkIn": { $lt: room.checkOut }, "rooms.checkOut": { $gt: room.checkIn } },
+                            { "rooms.roomId": targetCategoryId, "rooms.checkIn": { $lt: room.checkOut }, "rooms.checkOut": { $gt: room.checkIn } },
+                            { categoryId: targetCategoryId, checkIn: { $lt: room.checkOut }, checkOut: { $gt: room.checkIn } },
+                            { roomId: targetCategoryId, checkIn: { $lt: room.checkOut }, checkOut: { $gt: room.checkIn } }
+                        ]
+                    }).toArray()
+
+                    let alreadyBookedCount = 0
+                    activeBookings.forEach(b => {
+                        const matchingRooms = getBookingRooms(b).filter(r => 
+                            (String(r.categoryId) === String(targetCategoryId) || String(r.roomId) === String(targetCategoryId)) &&
+                            r.checkIn < room.checkOut &&
+                            r.checkOut > room.checkIn
+                        )
+                        alreadyBookedCount += matchingRooms.length
+                    })
+
+                    if ((alreadyBookedCount + requestedCount) > totalCategoryRooms) {
+                        const remaining = Math.max(0, totalCategoryRooms - alreadyBookedCount)
+                        return res.status(409).send({
+                            message: `Category "${category.name}" only has ${remaining} room(s) available from ${room.checkIn} to ${room.checkOut}.`
+                        })
+                    }
+                } else if (room.roomNo) {
+                    // Physical room check
+                    const existingBooking = await findRoomConflict(bookingCollection, room)
+                    if (existingBooking) {
+                        const conflictingRoom = getBookingRooms(existingBooking).find(existingRoom =>
+                            String(existingRoom.roomId) === String(room.roomId) &&
+                            existingRoom.checkIn < room.checkOut &&
+                            existingRoom.checkOut > room.checkIn
+                        )
+                        return res.status(409).send({
+                            message: `Room ${room.roomNo} is already reserved from ${conflictingRoom?.checkIn || existingBooking.checkIn} to ${conflictingRoom?.checkOut || existingBooking.checkOut}. Please select different dates or another room.`,
+                            conflictBookingId: existingBooking.bookingId
+                        })
+                    }
+                }
             }
 
             const today = new Date()
+            const requestedByRole = data.requestedByRole || data.role || "user"
+            const expireHours = getRequestBookingExpireHours(requestedByRole)
+            const requestExpiresAt = new Date(today.getTime() + expireHours * 60 * 60 * 1000)
             const bookingData = {
-                ...data,
+                name: data.name,
+                mobile: data.mobile,
+                address: data.address || "",
+                userEmail: data.userEmail || data.email || "",
+                rooms,
+                advanceAmount: Number(data.advanceAmount || 0),
                 createdAt: today,
-                status: "pending",
-                statusHistory: [{ status: "pending", time: today }]
+                requestedByRole,
+                requestExpiresAt,
+                status: BOOKING_STATUS.REQUEST_BOOKING,
+                statusHistory: [{ status: BOOKING_STATUS.REQUEST_BOOKING, time: today }]
             }
 
             for (let attempt = 1; attempt <= 5; attempt++) {
@@ -394,12 +663,13 @@ async function run() {
                     query.status = status
                 }
             }
-            const result = await bookingCollection
+            const bookings = await bookingCollection
                 .find(query)
                 .sort(sort)
                 .skip(Number(skip) || 0)
                 .limit(Number(limit) || 0)
                 .toArray()
+            const result = await hydrateBookingsWithRooms(bookings, roomCollection)
             if (skip || limit) {
                 const totalDataCount = await bookingCollection.countDocuments(query)
                 res.send({ result, totalDataCount })
@@ -410,21 +680,70 @@ async function run() {
 
         app.get("/booking/:id", verifyFBToken, async (req, res) => {
             const { id } = req.params
-            const query = { _id: new ObjectId(id) }
-            const result = await bookingCollection.findOne(query)
-            res.send(result)
+            const objectId = toObjectId(id)
+            const query = objectId ? { _id: objectId } : { bookingId: id }
+            const booking = await bookingCollection.findOne(query)
+            const [result] = await hydrateBookingsWithRooms(booking ? [booking] : [], roomCollection)
+            res.send(result || null)
         })
 
         app.patch("/booking/:id", verifyFBToken, async (req, res) => {
             const { id } = req.params
-            const { status } = req.body
-            const query = { _id: new ObjectId(id) }
+            const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
             const now = new Date()
-            const update = {
-                $set: { status },
-                $push: { statusHistory: { status, time: now } }
+            const { 
+                status, 
+                requestedByRole,
+                name,
+                mobile,
+                address,
+                userEmail,
+                rooms,
+                totalAmount,
+                paidAmount,
+                discountAmount,
+                advanceAmount,
+                reference,
+                transactionId,
+                notes
+            } = req.body
+
+            const updateData = { updatedAt: now }
+            if (name !== undefined) updateData.name = name
+            if (mobile !== undefined) updateData.mobile = mobile
+            if (address !== undefined) updateData.address = address
+            if (userEmail !== undefined) updateData.userEmail = userEmail
+            if (Array.isArray(rooms)) updateData.rooms = rooms
+            if (totalAmount !== undefined) updateData.totalAmount = Number(totalAmount)
+            if (paidAmount !== undefined) updateData.paidAmount = Number(paidAmount)
+            if (discountAmount !== undefined) updateData.discountAmount = Number(discountAmount)
+            if (advanceAmount !== undefined) updateData.advanceAmount = Number(advanceAmount)
+            if (reference !== undefined) updateData.reference = reference
+            if (transactionId !== undefined) updateData.transactionId = transactionId
+            if (notes !== undefined) updateData.notes = notes
+
+            const update = { $set: updateData }
+
+            if (status) {
+                updateData.status = status
+                updateData.statusUpdatedAt = now
+                update.$push = { statusHistory: { status, time: now } }
+
+                if (status === BOOKING_STATUS.REQUEST_BOOKING) {
+                    const expireHours = getRequestBookingExpireHours(requestedByRole)
+                    updateData.requestedByRole = requestedByRole || "user"
+                    updateData.requestExpiresAt = new Date(now.getTime() + expireHours * 60 * 60 * 1000)
+                } else {
+                    update.$unset = { requestExpiresAt: "" }
+                }
+
+                if (status === BOOKING_STATUS.CANCEL) {
+                    updateData.cancelledAt = now
+                }
             }
+
             const result = await bookingCollection.updateOne(query, update)
+            if (status) result.status = status
             res.send(result)
         })
 
@@ -434,34 +753,126 @@ async function run() {
             const result = await bookingCollection.deleteOne(query)
             res.send(result)
         })
-        // category and pricing 
-        app.get("/categoryandpricing", async (req, res) => {
-            const result = await categoryAndPricingCollection.find().toArray()
+        // CATEGORY & ROOM ..............................................
+        app.get("/categoryandroom", async (req, res) => {
+            const result = await categoryAndRoomCollection.find().toArray()
             res.send(result)
         })
-        app.patch("/categoryandpricing/:id", async (req, res) => {
+
+        app.get("/categoryandroom/:id", async (req, res) => {
+            const { id } = req.params
+            const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
+            let result = await categoryAndRoomCollection.findOne(query)
+            if (!result) {
+                result = await roomCollection.findOne(query)
+            }
+            if (!result) {
+                return res.status(404).send({ message: "Category not found" })
+            }
+            res.send(result)
+        })
+
+        app.patch("/categoryandroom/:id", async (req, res) => {
             const { id } = req.params
             const data = req.body
             data.updatedAt = new Date()
             const query = { _id: new ObjectId(id) }
             const update = { $set: data }
-            const result = await categoryAndPricingCollection.updateOne(query, update)
-            res.send(result)
-        })
-        app.post("/categoryandpricing", async (req, res) => {
-            const data = req.body
-            data.createdAt = new Date()
-            data.updatedAt = new Date()
-            const result = await categoryAndPricingCollection.insertOne(data)
-            res.send(result)
-        })
-        app.delete('/categoryandpricing/:id', async (req, res) => {
-            const { id } = req.params
-            const query = { _id: new ObjectId(id) }
-            const result = await categoryAndPricingCollection.deleteOne(query)
+            const result = await categoryAndRoomCollection.updateOne(query, update)
             res.send(result)
         })
 
+        app.post("/categoryandroom", async (req, res) => {
+            const data = req.body
+            data.createdAt = new Date()
+            data.updatedAt = new Date()
+            const result = await categoryAndRoomCollection.insertOne(data)
+            res.send(result)
+        })
+
+        // Check if ANY room under a category is available for given dates
+        app.get("/check-category-availability", async (req, res) => {
+            const { categoryId, checkIn, checkOut } = req.query
+            if (!categoryId || !checkIn || !checkOut) {
+                return res.status(400).send({ available: false, message: "categoryId, checkIn and checkOut are required" })
+            }
+
+            // Get the category to find its room numbers
+            const catObjectId = toObjectId(categoryId)
+            if (!catObjectId) return res.status(400).send({ available: false, message: "Invalid categoryId" })
+
+            const category = await categoryAndRoomCollection.findOne({ _id: catObjectId })
+            if (!category) return res.status(404).send({ available: false, message: "Category not found" })
+
+            const roomNumbers = Array.isArray(category.roomNumbers) ? category.roomNumbers : []
+            if (roomNumbers.length === 0) {
+                return res.send({ available: true, message: "Category has rooms available." })
+            }
+
+            // Find all rooms in the rooms collection matching these room numbers
+            const matchingRooms = await roomCollection.find({
+                roomNo: { $in: roomNumbers },
+                status: "active"
+            }).toArray()
+
+            if (matchingRooms.length === 0) {
+                // No rooms tracked in rooms collection — allow booking
+                return res.send({ available: true, message: "Category has rooms available." })
+            }
+
+            // For each room, check if it has an active booking conflicting with the dates
+            let anyAvailable = false
+            for (const room of matchingRooms) {
+                const conflict = await findRoomConflict(bookingCollection, {
+                    roomId: String(room._id),
+                    checkIn,
+                    checkOut
+                })
+                if (!conflict) {
+                    anyAvailable = true
+                    break
+                }
+            }
+
+            if (anyAvailable) {
+                res.send({ available: true, message: "Rooms are available in this category for the selected dates." })
+            } else {
+                res.send({
+                    available: false,
+                    message: `No rooms are available in this category from ${checkIn} to ${checkOut}. Please try different dates.`
+                })
+            }
+        })
+
+        app.delete('/categoryandroom/:id', async (req, res) => {
+            const { id } = req.params
+            const query = { _id: new ObjectId(id) }
+
+            // Get the category first to find Cloudinary images to delete
+            const category = await categoryAndRoomCollection.findOne(query)
+
+            // Collect all public IDs to delete from Cloudinary
+            const publicIdsToDelete = []
+            if (category?.imagePublicId) publicIdsToDelete.push(category.imagePublicId)
+            if (Array.isArray(category?.images)) {
+                category.images.forEach(img => {
+                    if (img?.publicId && !publicIdsToDelete.includes(img.publicId)) {
+                        publicIdsToDelete.push(img.publicId)
+                    }
+                })
+            }
+
+            await Promise.all(publicIdsToDelete.map(async (pId) => {
+                try {
+                    await cloudinary.uploader.destroy(pId)
+                } catch (err) {
+                    console.log("Cloudinary delete error for", pId, ":", err.message)
+                }
+            }))
+
+            const result = await categoryAndRoomCollection.deleteOne(query)
+            res.send(result)
+        })
 
         // ADMIN OVERVIEW ..............................................
         app.get("/admin/overview", verifyFBToken, verifyAdmin, async (req, res) => {
@@ -469,10 +880,6 @@ async function run() {
                 $facet: {
                     statusCounts: [
                         { $group: { _id: "$status", count: { $sum: 1 } } }
-                    ],
-                    totalRevenue: [
-                        { $match: { status: "confirmed" } },
-                        { $group: { _id: null, total: { $sum: "$totalAmount" } } }
                     ],
                     bookingsPerDay: [
                         {
@@ -483,25 +890,38 @@ async function run() {
                         },
                         { $sort: { _id: 1 } },
                         { $limit: 7 }
-                    ],
-                    bookingsPerRoom: [
-                        { $group: { _id: { $ifNull: ["$roomName", "$roomCategory"] }, count: { $sum: 1 } } },
-                        { $sort: { count: -1 } }
                     ]
                 }
             }]).toArray())[0]
+
+            const allBookings = await bookingCollection.find().toArray()
+            const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
+            const confirmedBookings = hydratedBookings.filter(booking =>
+                [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
+            )
+            const totalRevenue = confirmedBookings.reduce((total, booking) => total + getBookingTotal(booking), 0)
+            const roomCountMap = {}
+            hydratedBookings.forEach(booking => {
+                getBookingRooms(booking).forEach(room => {
+                    const label = room.room?.name || room.room?.category || room.roomName || room.roomCategory || "Room"
+                    roomCountMap[label] = (roomCountMap[label] || 0) + 1
+                })
+            })
+            const bookingsPerRoom = Object.entries(roomCountMap)
+                .map(([roomName, count]) => ({ _id: roomName, count }))
+                .sort((a, b) => b.count - a.count)
 
             const statusMap = {}
             dataFromBookings.statusCounts.forEach(s => { statusMap[s._id] = s.count })
 
             const result = {
-                totalBookings: (statusMap.pending || 0) + (statusMap.confirmed || 0) + (statusMap.cancelled || 0),
-                confirmedCount: statusMap.confirmed || 0,
-                pendingCount: statusMap.pending || 0,
-                cancelledCount: statusMap.cancelled || 0,
-                totalRevenue: dataFromBookings.totalRevenue[0]?.total || 0,
+                totalBookings: Object.values(statusMap).reduce((total, count) => total + count, 0),
+                confirmedCount: (statusMap.booking_confirmed || 0) + (statusMap.checked_id || 0) + (statusMap.checked_out || 0) + (statusMap.confirmed || 0),
+                pendingCount: (statusMap.request_booking || 0) + (statusMap.payment_waiting || 0) + (statusMap.pending || 0),
+                cancelledCount: (statusMap.cancel || 0) + (statusMap.cancelled || 0),
+                totalRevenue,
                 bookingsPerDay: dataFromBookings.bookingsPerDay,
-                bookingsPerRoom: dataFromBookings.bookingsPerRoom
+                bookingsPerRoom
             }
             res.send(result)
         })
