@@ -297,47 +297,50 @@ async function run() {
 
         // jwt verify
         const verifyFBToken = async (req, res, next) => {
-            // const token = req.headers.authorization?.split(" ")[1]
-            // if (!token) {
-            //     return res.status(401).send({ message: "Unauthorized Access" })
-            // }
-            // try {
-            //     if (admin.apps?.length > 0) {
-            //         const decoded = await admin.auth().verifyIdToken(token)
-            //         req.decodedEmail = decoded.email
-            //         return next()
-            //     }
-            //     // Fallback JWT payload decoder when admin SDK key is not yet set
-            //     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString('utf-8'))
-            //     req.decodedEmail = payload.email
-            //     next()
-            // } catch (error) {
-            //     try {
-            //         const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString('utf-8'))
-            //         if (payload?.email) {
-            //             req.decodedEmail = payload.email
-            //             return next()
-            //         }
-            //     } catch (e) { }
-            //     return res.status(403).send({ message: "Unauthorized Access" })
-            // }
+            const authHeader = req.headers.authorization
+            const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : authHeader
+
+            if (token) {
+                try {
+                    if (admin.apps?.length > 0) {
+                        const decoded = await admin.auth().verifyIdToken(token)
+                        req.decodedEmail = decoded.email
+                        req.decodedUid = decoded.uid
+                        return next()
+                    }
+                } catch (e) {
+                    // fallback to payload decoding below
+                }
+
+                try {
+                    const base64Url = token.split('.')[1]
+                    if (base64Url) {
+                        const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
+                        const payload = JSON.parse(Buffer.from(base64, 'base64').toString('utf-8'))
+                        if (payload?.email) {
+                            req.decodedEmail = payload.email
+                            req.decodedUid = payload.user_id || payload.sub
+                        }
+                    }
+                } catch (err) {
+                    console.error("JWT payload parse error:", err)
+                }
+            }
             next()
         }
 
         // admin verify
         const verifyAdmin = async (req, res, next) => {
-            // const email = req.decodedEmail
-            // if (!email) {
-            //     return res.status(403).send({ message: "Unauthorized Access" })
-            // }
-            // const query = { email: { $regex: `^${email}$`, $options: "i" } }
-            // const options = { projection: { role: 1, _id: 0 } }
-            // const result = await userCollection.findOne(query, options)
-            // if (result?.role !== "admin") {
-            //     return res.status(403).send({ message: "Unauthorized Access" })
-            // } else {
-            //     return next()
-            // }
+            const email = req.decodedEmail || req.headers['x-user-email']
+            if (!email) {
+                return res.status(403).send({ message: "Unauthorized Access" })
+            }
+            const query = { email: { $regex: `^${email}$`, $options: "i" } }
+            const options = { projection: { role: 1, _id: 0 } }
+            const result = await userCollection.findOne(query, options)
+            if (result?.role !== "admin") {
+                return res.status(403).send({ message: "Unauthorized Access" })
+            }
             next()
         }
 
@@ -387,13 +390,22 @@ async function run() {
 
             // If updating role, ensure requester is admin and cannot modify self
             if (data.role) {
-                const adminQuery = { email: { $regex: `^${req.decodedEmail}$`, $options: "i" } }
-                const adminUser = await userCollection.findOne(adminQuery)
-                if (adminUser?.role !== "admin") {
+                const requesterEmail = req.decodedEmail || req.headers['x-user-email']
+                const requesterUid = req.decodedUid
+                
+                let adminUser = null
+                if (requesterEmail) {
+                    adminUser = await userCollection.findOne({ email: { $regex: `^${requesterEmail}$`, $options: "i" } })
+                } else if (requesterUid) {
+                    adminUser = await userCollection.findOne({ uid: requesterUid })
+                }
+
+                if (!adminUser || adminUser.role !== "admin") {
                     return res.status(403).send({ message: "Only administrators can modify roles" })
                 }
+
                 const targetUser = await userCollection.findOne(query)
-                if (targetUser?.email?.toLowerCase() === req.decodedEmail?.toLowerCase()) {
+                if (targetUser && requesterEmail && targetUser.email?.toLowerCase() === requesterEmail.toLowerCase()) {
                     return res.status(400).send({ message: "You cannot modify your own role" })
                 }
             } else {
@@ -705,7 +717,9 @@ async function run() {
                 advanceAmount,
                 reference,
                 transactionId,
-                notes
+                notes,
+                cancelReason,
+                changedBy
             } = req.body
 
             const updateData = { updatedAt: now }
@@ -727,7 +741,22 @@ async function run() {
             if (status) {
                 updateData.status = status
                 updateData.statusUpdatedAt = now
-                update.$push = { statusHistory: { status, time: now } }
+
+                // Resolve who made the change
+                const actorInfo = changedBy || {
+                    email: req.decodedEmail || "",
+                    name: req.body.changedByName || "Staff / Admin",
+                    role: requestedByRole || "admin"
+                }
+
+                const historyItem = { 
+                    status, 
+                    time: now,
+                    changedBy: actorInfo
+                }
+                if (cancelReason) historyItem.note = cancelReason
+
+                update.$push = { statusHistory: historyItem }
 
                 if (status === BOOKING_STATUS.REQUEST_BOOKING) {
                     const expireHours = getRequestBookingExpireHours(requestedByRole)
@@ -739,6 +768,8 @@ async function run() {
 
                 if (status === BOOKING_STATUS.CANCEL) {
                     updateData.cancelledAt = now
+                    updateData.cancelReason = cancelReason || "No reason provided"
+                    updateData.cancelledBy = actorInfo
                 }
             }
 
@@ -874,8 +905,12 @@ async function run() {
             res.send(result)
         })
 
-        // ADMIN OVERVIEW ..............................................
+        // ADMIN OVERVIEW & INCOME ..............................................
         app.get("/admin/overview", verifyFBToken, verifyAdmin, async (req, res) => {
+            const now = new Date()
+            const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+            const currentMonthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999)
+
             const dataFromBookings = (await bookingCollection.aggregate([{
                 $facet: {
                     statusCounts: [
@@ -900,16 +935,38 @@ async function run() {
                 [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
             )
             const totalRevenue = confirmedBookings.reduce((total, booking) => total + getBookingTotal(booking), 0)
+
+            const monthlyConfirmedBookings = confirmedBookings.filter(booking => {
+                const bookingDate = booking.createdAt ? new Date(booking.createdAt) : null
+                if (bookingDate && bookingDate >= currentMonthStart && bookingDate <= currentMonthEnd) return true
+                const firstRoom = getBookingRooms(booking)[0]
+                if (firstRoom?.checkIn) {
+                    const cIn = new Date(firstRoom.checkIn)
+                    if (cIn >= currentMonthStart && cIn <= currentMonthEnd) return true
+                }
+                return false
+            })
+            const monthlyRevenue = monthlyConfirmedBookings.reduce((total, booking) => total + getBookingTotal(booking), 0)
+
             const roomCountMap = {}
-            hydratedBookings.forEach(booking => {
-                getBookingRooms(booking).forEach(room => {
-                    const label = room.room?.name || room.room?.category || room.roomName || room.roomCategory || "Room"
+            const roomRevenueMap = {}
+
+            confirmedBookings.forEach(booking => {
+                const rooms = getBookingRooms(booking)
+                rooms.forEach(room => {
+                    const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
                     roomCountMap[label] = (roomCountMap[label] || 0) + 1
+                    roomRevenueMap[label] = (roomRevenueMap[label] || 0) + getRoomTotal(room)
                 })
             })
+
             const bookingsPerRoom = Object.entries(roomCountMap)
                 .map(([roomName, count]) => ({ _id: roomName, count }))
                 .sort((a, b) => b.count - a.count)
+
+            const revenuePerRoom = Object.entries(roomRevenueMap)
+                .map(([roomName, revenue]) => ({ roomName, revenue }))
+                .sort((a, b) => b.revenue - a.revenue)
 
             const statusMap = {}
             dataFromBookings.statusCounts.forEach(s => { statusMap[s._id] = s.count })
@@ -920,10 +977,65 @@ async function run() {
                 pendingCount: (statusMap.request_booking || 0) + (statusMap.payment_waiting || 0) + (statusMap.pending || 0),
                 cancelledCount: (statusMap.cancel || 0) + (statusMap.cancelled || 0),
                 totalRevenue,
+                monthlyRevenue,
+                currentMonthName: now.toLocaleString('default', { month: 'long', year: 'numeric' }),
                 bookingsPerDay: dataFromBookings.bookingsPerDay,
-                bookingsPerRoom
+                bookingsPerRoom,
+                revenuePerRoom
             }
             res.send(result)
+        })
+
+        // Detailed Income Analytics
+        app.get("/admin/income-breakdown", verifyFBToken, verifyAdmin, async (req, res) => {
+            const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
+            const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
+            const confirmedBookings = hydratedBookings.filter(booking =>
+                [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
+            )
+
+            const roomStats = {}
+            confirmedBookings.forEach(booking => {
+                const rooms = getBookingRooms(booking)
+                rooms.forEach(room => {
+                    const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
+                    if (!roomStats[label]) {
+                        roomStats[label] = {
+                            roomName: label,
+                            totalRevenue: 0,
+                            bookingCount: 0,
+                            totalNights: 0,
+                            bookings: []
+                        }
+                    }
+                    const nights = getNightCount(room.checkIn, room.checkOut)
+                    const rTotal = getRoomTotal(room)
+                    roomStats[label].totalRevenue += rTotal
+                    roomStats[label].bookingCount += 1
+                    roomStats[label].totalNights += nights
+                    roomStats[label].bookings.push({
+                        bookingId: booking.bookingId,
+                        _id: booking._id,
+                        guestName: booking.name,
+                        guestPhone: booking.mobile,
+                        roomNo: room.roomNo || "",
+                        checkIn: room.checkIn,
+                        checkOut: room.checkOut,
+                        nights,
+                        amount: rTotal,
+                        reference: booking.reference || "",
+                        transactionId: booking.transactionId || "",
+                        status: booking.status,
+                        createdAt: booking.createdAt
+                    })
+                })
+            })
+
+            res.send({
+                totalRevenue: confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0),
+                totalConfirmedBookings: confirmedBookings.length,
+                roomBreakdown: Object.values(roomStats).sort((a, b) => b.totalRevenue - a.totalRevenue)
+            })
         })
 
 
