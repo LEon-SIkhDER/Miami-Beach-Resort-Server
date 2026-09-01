@@ -291,20 +291,19 @@ const startRequestBookingAutoCancelJob = (bookingCollection) => {
     })
 }
 
-async function run() {
-    try {
-        const db = client.db("miami_beach_resort_db")
-        // collections
-        const userCollection = db.collection("users")
-        const roomCollection = db.collection("rooms")
-        const bookingCollection = db.collection("bookings")
-        const categoryAndRoomCollection = db.collection("categoryandroom")
-        const outOfOrderCollection = db.collection("out_of_order")
+const db = client.db("miami_beach_resort_db")
+// collections
+const userCollection = db.collection("users")
+const roomCollection = db.collection("rooms")
+const bookingCollection = db.collection("bookings")
+const categoryAndRoomCollection = db.collection("categoryandroom")
+const outOfOrderCollection = db.collection("out_of_order")
 
-        await ensureBookingIdIndex(bookingCollection)
-        startRequestBookingAutoCancelJob(bookingCollection)
+// Initialize indexes and cron in background without blocking startup / route registration
+ensureBookingIdIndex(bookingCollection).catch(err => console.log("Index init error:", err.message))
+startRequestBookingAutoCancelJob(bookingCollection)
 
-        // Simplified fast auth pass-through (no JWT bottlenecks)
+// Simplified fast auth pass-through (no JWT bottlenecks)
         const verifyFBToken = (req, res, next) => {
             const authHeader = req.headers.authorization
             const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : authHeader
@@ -1559,16 +1558,10 @@ async function run() {
             }
         })
 
-
-        console.log("Pinged your deployment. You successfully connected to MongoDB!")
-    } finally {
-        // await client.close()
-    }
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+    app.listen(port, () => {
+        console.log(`Server is running on port:${port}`)
+    })
 }
-run().catch(console.dir)
-
-app.listen(port, () => {
-    console.log(`Server is running on port:${port}`)
-})
 
 module.exports = app
