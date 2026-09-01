@@ -414,15 +414,156 @@ startRequestBookingAutoCancelJob(bookingCollection)
             res.send(result)
         })
 
-        // all users for admin
+        // all users for admin with workflow metrics
         app.get("/users", verifyFBToken, verifyAdmin, async (req, res) => {
             const { search } = req.query
             const query = {}
             if (search) {
-                query.name = { $regex: search, $options: "i" }
+                query.$or = [
+                    { name: { $regex: search, $options: "i" } },
+                    { email: { $regex: search, $options: "i" } },
+                    { phone: { $regex: search, $options: "i" } }
+                ]
             }
-            const result = await userCollection.find(query).sort({ _id: -1 }).toArray()
-            res.send(result)
+            const users = await userCollection.find(query).sort({ _id: -1 }).toArray()
+            const allBookings = await bookingCollection.find().toArray()
+
+            const enrichedUsers = users.map(u => {
+                const uEmail = String(u.email || "").trim().toLowerCase()
+                const uName = String(u.name || "").trim().toLowerCase()
+
+                const userBookings = allBookings.filter(b => {
+                    const ref = String(b.reference || "").trim().toLowerCase()
+                    const bEmail = String(b.userEmail || b.email || b.bookedBy?.email || b.createdBy?.email || "").trim().toLowerCase()
+                    const bName = String(b.bookedBy?.name || b.createdBy?.name || "").trim().toLowerCase()
+
+                    if (uEmail && (ref === uEmail || bEmail === uEmail || ref.includes(uEmail))) return true
+                    if (uName && uName.length >= 2 && (ref === uName || bName === uName || ref.includes(uName))) return true
+                    return false
+                })
+
+                const confirmedBookings = userBookings.filter(b => 
+                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(b.status)
+                )
+
+                const totalSales = confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const totalPaid = confirmedBookings.reduce((sum, b) => sum + Number(b.paidAmount || 0), 0)
+                const totalDue = Math.max(0, totalSales - totalPaid)
+
+                return {
+                    ...u,
+                    stats: {
+                        totalBookings: userBookings.length,
+                        confirmedBookings: confirmedBookings.length,
+                        pendingBookings: userBookings.filter(b => [BOOKING_STATUS.REQUEST_BOOKING, BOOKING_STATUS.PAYMENT_WAITING, "pending"].includes(b.status)).length,
+                        cancelledBookings: userBookings.filter(b => [BOOKING_STATUS.CANCEL, "cancelled"].includes(b.status)).length,
+                        totalSales,
+                        totalPaid,
+                        totalDue,
+                        lastBookingDate: userBookings.length ? userBookings.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0].createdAt : null
+                    }
+                }
+            })
+
+            res.send(enrichedUsers)
+        })
+
+        // Detailed user workflow & activity breakdown for Admin
+        app.get("/admin/user-workflow/:userId", verifyFBToken, verifyAdmin, async (req, res) => {
+            try {
+                const { userId } = req.params
+                const query = toObjectId(userId) ? { _id: toObjectId(userId) } : { uid: userId }
+                let targetUser = await userCollection.findOne(query)
+
+                if (!targetUser) {
+                    targetUser = await userCollection.findOne({ email: { $regex: `^${userId}$`, $options: "i" } })
+                }
+
+                if (!targetUser) {
+                    return res.status(404).send({ message: "User not found" })
+                }
+
+                const uEmail = String(targetUser.email || "").trim().toLowerCase()
+                const uName = String(targetUser.name || "").trim().toLowerCase()
+
+                const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
+                const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection, categoryAndRoomCollection)
+
+                const userBookings = hydratedBookings.filter(b => {
+                    const ref = String(b.reference || "").trim().toLowerCase()
+                    const bEmail = String(b.userEmail || b.email || b.bookedBy?.email || b.createdBy?.email || "").trim().toLowerCase()
+                    const bName = String(b.bookedBy?.name || b.createdBy?.name || "").trim().toLowerCase()
+
+                    if (uEmail && (ref === uEmail || bEmail === uEmail || ref.includes(uEmail))) return true
+                    if (uName && uName.length >= 2 && (ref === uName || bName === uName || ref.includes(uName))) return true
+                    return false
+                })
+
+                const confirmedBookings = userBookings.filter(b => 
+                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(b.status)
+                )
+
+                const totalSales = confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const totalPaid = confirmedBookings.reduce((sum, b) => sum + Number(b.paidAmount || 0), 0)
+                const totalDue = Math.max(0, totalSales - totalPaid)
+
+                // Activity logs performed by this user
+                const activityLogs = []
+                allBookings.forEach(b => {
+                    if (Array.isArray(b.statusHistory)) {
+                        b.statusHistory.forEach(hist => {
+                            const act = hist.changedBy || {}
+                            if ((uEmail && act.email?.toLowerCase() === uEmail) || (uName && act.name?.toLowerCase() === uName)) {
+                                activityLogs.push({
+                                    type: "status_change",
+                                    bookingId: b.bookingId,
+                                    bookingDbId: b._id,
+                                    guestName: b.name,
+                                    status: hist.status,
+                                    time: hist.time,
+                                    note: hist.note
+                                })
+                            }
+                        })
+                    }
+                    if (Array.isArray(b.paymentHistory)) {
+                        b.paymentHistory.forEach(pay => {
+                            const col = pay.collectedBy || {}
+                            if ((uEmail && col.email?.toLowerCase() === uEmail) || (uName && col.name?.toLowerCase() === uName)) {
+                                activityLogs.push({
+                                    type: "payment_collection",
+                                    bookingId: b.bookingId,
+                                    bookingDbId: b._id,
+                                    guestName: b.name,
+                                    amount: pay.amount,
+                                    method: pay.paymentMethod,
+                                    time: pay.date,
+                                    note: pay.note,
+                                    transactionId: pay.transactionId
+                                })
+                            }
+                        })
+                    }
+                })
+
+                res.send({
+                    user: targetUser,
+                    metrics: {
+                        totalBookings: userBookings.length,
+                        confirmedBookings: confirmedBookings.length,
+                        pendingBookings: userBookings.filter(b => [BOOKING_STATUS.REQUEST_BOOKING, BOOKING_STATUS.PAYMENT_WAITING, "pending"].includes(b.status)).length,
+                        cancelledBookings: userBookings.filter(b => [BOOKING_STATUS.CANCEL, "cancelled"].includes(b.status)).length,
+                        totalSales,
+                        totalPaid,
+                        totalDue,
+                    },
+                    bookings: userBookings,
+                    activities: activityLogs.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0))
+                })
+            } catch (err) {
+                console.error("User workflow fetch error:", err)
+                res.status(500).send({ message: "Failed to load user workflow details" })
+            }
         })
 
 
@@ -672,6 +813,16 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 const expireHours = getRequestBookingExpireHours(requestedByRole)
                 const requestExpiresAt = status === BOOKING_STATUS.REQUEST_BOOKING ? new Date(today.getTime() + expireHours * 60 * 60 * 1000) : undefined
 
+                const resolvedReference = (data.reference && String(data.reference).trim()) 
+                    ? String(data.reference).trim() 
+                    : (requestedByRole === "user" ? "Website Direct" : (data.changedBy?.name || "Front Desk"))
+
+                const actorInfo = data.changedBy || data.bookedBy || {
+                    name: data.name || "Guest",
+                    email: data.userEmail || data.email || "",
+                    role: requestedByRole
+                }
+
                 const bookingData = {
                     name: data.name,
                     mobile: data.mobile,
@@ -686,17 +837,15 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     paymentHistory: data.paidAmount && Number(data.paidAmount) > 0 ? [{
                         amount: Number(data.paidAmount),
                         paymentMethod: data.paymentMethod || "Cash",
-                        reference: data.reference || "",
+                        reference: resolvedReference,
                         transactionId: data.transactionId || "",
                         note: "Initial payment during reservation",
                         date: today,
-                        collectedBy: data.changedBy || {
-                            name: data.name || "Admin",
-                            email: data.userEmail || "",
-                            role: requestedByRole
-                        }
+                        collectedBy: actorInfo
                     }] : [],
-                    reference: data.reference || "",
+                    reference: resolvedReference,
+                    bookedBy: data.bookedBy || actorInfo,
+                    createdBy: data.createdBy || actorInfo,
                     transactionId: data.transactionId || "",
                     notes: data.notes || "",
                     createdAt: today,
@@ -705,11 +854,7 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     statusHistory: [{ 
                         status, 
                         time: today,
-                        changedBy: data.changedBy || {
-                            name: data.name || "Admin",
-                            email: data.userEmail || "",
-                            role: requestedByRole
-                        }
+                        changedBy: actorInfo
                     }]
                 }
                 if (requestExpiresAt) {
@@ -739,15 +884,41 @@ startRequestBookingAutoCancelJob(bookingCollection)
         app.post("/booking", handleCreateBooking)
 
         app.get("/bookings", verifyFBToken, async (req, res) => {
-            const { email, status, skip, limit } = req.query
+            const { email, status, reference, search, skip, limit } = req.query
             let query = {}
             let sort = { _id: -1 }
             if (email) query.userEmail = email
+            if (reference) {
+                query.$or = [
+                    { reference: { $regex: reference, $options: "i" } },
+                    { "bookedBy.name": { $regex: reference, $options: "i" } },
+                    { "bookedBy.email": { $regex: reference, $options: "i" } },
+                    { "createdBy.name": { $regex: reference, $options: "i" } }
+                ]
+            }
             if (status) {
                 if (Array.isArray(status)) {
                     query.status = { $in: status }
                 } else {
                     query.status = status
+                }
+            }
+            if (search) {
+                const sRegex = { $regex: search, $options: "i" }
+                const searchFilters = [
+                    { name: sRegex },
+                    { mobile: sRegex },
+                    { bookingId: sRegex },
+                    { reference: sRegex },
+                    { address: sRegex },
+                    { "bookedBy.name": sRegex },
+                    { "bookedBy.email": sRegex }
+                ]
+                if (query.$or) {
+                    query.$and = [{ $or: query.$or }, { $or: searchFilters }]
+                    delete query.$or
+                } else {
+                    query.$or = searchFilters
                 }
             }
             const bookings = await bookingCollection
