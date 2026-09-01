@@ -330,6 +330,18 @@ async function run() {
             next()
         }
 
+        // Strict Admin Only middleware for critical operations (e.g. Delete Category)
+        const verifyAdminOnly = async (req, res, next) => {
+            const email = req.decodedEmail || req.headers['x-user-email']
+            if (email) {
+                const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
+                if (user && user.role !== "admin") {
+                    return res.status(403).send({ message: "Forbidden: Only Admin can delete categories." })
+                }
+            }
+            next()
+        }
+
 
         // USER RELATED CODES ..............................................
         app.post("/users", async (req, res) => {
@@ -850,6 +862,124 @@ async function run() {
             res.send(result)
         })
 
+        // Dedicated Reservation Voucher / Printable Invoice Data API
+        app.get("/booking/:id/reservation-voucher", async (req, res) => {
+            try {
+                const { id } = req.params
+                const objectId = toObjectId(id)
+                const query = objectId ? { _id: objectId } : { bookingId: id }
+                
+                const booking = await bookingCollection.findOne(query)
+                if (!booking) {
+                    return res.status(404).send({ message: "Reservation not found." })
+                }
+
+                // Format & enrich room lines
+                const rawRooms = Array.isArray(booking.rooms) && booking.rooms.length > 0
+                    ? booking.rooms
+                    : [{
+                        categoryName: booking.category || booking.categoryName || "Room",
+                        checkIn: booking.checkIn,
+                        checkOut: booking.checkOut,
+                        pricePerNight: booking.pricePerNight || booking.price || 0,
+                        adults: booking.adults || 2,
+                        babies: booking.babies || 0,
+                        roomNo: booking.roomNo || ""
+                    }]
+
+                const roomRows = rawRooms.map(r => {
+                    const checkIn = r.checkIn || booking.checkIn
+                    const checkOut = r.checkOut || booking.checkOut
+                    let nights = 1
+                    if (checkIn && checkOut) {
+                        const start = new Date(checkIn)
+                        const end = new Date(checkOut)
+                        if (!isNaN(start.getTime()) && !isNaN(end.getTime()) && end > start) {
+                            nights = Math.max(1, Math.ceil((end - start) / (1000 * 60 * 60 * 24)))
+                        }
+                    }
+                    const tariff = Number(r.pricePerNight || r.price || 0)
+                    const subtotal = tariff * nights
+                    return {
+                        roomType: r.categoryName || r.category || r.name || "Room Category",
+                        roomNo: r.roomNo || "",
+                        arrivalDate: checkIn,
+                        departureDate: checkOut,
+                        roomTariff: tariff,
+                        roomQty: 1,
+                        roomNights: nights,
+                        total: subtotal
+                    }
+                })
+
+                const totalAmount = Number(booking.totalAmount || booking.total || roomRows.reduce((sum, r) => sum + r.total, 0))
+                const paidAmount = Number(booking.paidAmount || booking.advanceAmount || 0)
+                const dueAmount = Math.max(0, totalAmount - paidAmount)
+
+                const totalAdults = rawRooms.reduce((sum, r) => sum + Number(r.adults || 1), 0)
+                const totalChildren = rawRooms.reduce((sum, r) => sum + Number(r.babies || 0), 0)
+                const totalNights = roomRows.reduce((sum, r) => Math.max(sum, r.roomNights), 0)
+
+                const creator = booking.reference || booking.changedBy?.name || "Front Desk"
+
+                const voucherData = {
+                    resort: {
+                        name: "MIAMI BEACH RESORT",
+                        address: "Marin Drive Road,South Kolatoli, Cox's Bazar. 4700",
+                        hotlines: ["+8801341849375", "+8801341849376"],
+                        email: "Info.miamibeachresort@gmail.com",
+                        checkInTime: "13:00:00 Hours",
+                        checkOutTime: "11:00:00 Hours"
+                    },
+                    reservation: {
+                        id: booking._id,
+                        bookingId: booking.bookingId || id,
+                        status: booking.status || "confirmed",
+                        printDate: new Date(),
+                        createdDate: booking.createdAt || new Date(),
+                        creator: creator,
+                        guest: {
+                            name: booking.name || "Guest",
+                            email: booking.userEmail || booking.email || "",
+                            mobile: booking.mobile || "",
+                            address: booking.address || "",
+                            organization: booking.organization || ""
+                        },
+                        details: {
+                            arrivalDate: booking.checkIn || roomRows[0]?.arrivalDate,
+                            departureDate: booking.checkOut || roomRows[0]?.departureDate,
+                            mode: "Self",
+                            totalNights: totalNights,
+                            guestCount: {
+                                adults: totalAdults,
+                                children: totalChildren,
+                                total: totalAdults + totalChildren
+                            },
+                            airportPickUp: "NO",
+                            flightEta: "",
+                            airportDrop: "NO",
+                            flightEtd: ""
+                        },
+                        rooms: roomRows,
+                        financials: {
+                            totalAmount,
+                            paidAmount,
+                            dueAmount,
+                            discountAmount: Number(booking.discountAmount || 0),
+                            paymentMethod: booking.paymentMethod || "M-Banking Advance"
+                        },
+                        reference: creator,
+                        notes: booking.notes || ""
+                    }
+                }
+
+                res.send(voucherData)
+            } catch (err) {
+                console.error("Voucher API error:", err)
+                res.status(500).send({ message: "Failed to generate voucher data." })
+            }
+        })
+
         // Add due payment to a booking
         app.post("/booking/:id/add-payment", async (req, res) => {
             try {
@@ -1117,7 +1247,7 @@ async function run() {
             }
         })
 
-        app.delete('/categoryandroom/:id', async (req, res) => {
+        app.delete('/categoryandroom/:id', verifyFBToken, verifyAdminOnly, async (req, res) => {
             const { id } = req.params
             const query = { _id: new ObjectId(id) }
 
