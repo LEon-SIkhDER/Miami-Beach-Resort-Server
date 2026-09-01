@@ -165,13 +165,46 @@ const getRoomTotal = (room = {}) => {
     return getNightCount(room.checkIn, room.checkOut) * Number(room.pricePerNight || 0)
 }
 
-const getBookingTotal = (booking = {}) => {
+const getBookingSubtotal = (booking = {}) => {
     const rooms = getBookingRooms(booking)
     if (rooms.length) {
         const total = rooms.reduce((sum, room) => sum + getRoomTotal(room), 0)
-        return total || Number(booking.totalAmount || 0)
+        if (total > 0) return total
     }
-    return Number(booking.totalAmount || 0)
+    return Number(booking.subtotal || booking.standardTotal || booking.totalAmount || 0)
+}
+
+const getBookingDiscount = (booking = {}) => {
+    return Number(booking.discountAmount || booking.discount || booking.specialDiscount || 0)
+}
+
+const getBookingTotal = (booking = {}) => {
+    const subtotal = getBookingSubtotal(booking)
+    const discount = getBookingDiscount(booking)
+
+    if (booking.totalAmount !== undefined && booking.totalAmount !== null && !isNaN(Number(booking.totalAmount))) {
+        const t = Number(booking.totalAmount)
+        // If stored totalAmount equals subtotal and there is a discount, net payable is subtotal - discount
+        if (discount > 0 && Math.abs(t - subtotal) < 0.01) {
+            return Math.max(0, subtotal - discount)
+        }
+        // If stored totalAmount is explicitly set (e.g. customized authority price)
+        if (t > 0 && t <= subtotal) {
+            return t
+        }
+    }
+
+    return Math.max(0, subtotal - discount)
+}
+
+const getBookingPaidAmount = (booking = {}) => {
+    return Number(booking.paidAmount !== undefined && booking.paidAmount !== null ? booking.paidAmount : (booking.advanceAmount || 0))
+}
+
+const getBookingDueAmount = (booking = {}) => {
+    const payableTotal = getBookingTotal(booking)
+    const paid = getBookingPaidAmount(booking)
+    return Math.max(0, payableTotal - paid)
 }
 
 const getRoomIdsForLookup = (bookings = []) => {
@@ -416,7 +449,7 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
         // all users for admin with workflow metrics
         app.get("/users", verifyFBToken, verifyAdmin, async (req, res) => {
-            const { search } = req.query
+            const { search, role } = req.query
             const query = {}
             if (search) {
                 query.$or = [
@@ -424,6 +457,24 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     { email: { $regex: search, $options: "i" } },
                     { phone: { $regex: search, $options: "i" } }
                 ]
+            }
+            if (role && role !== "all") {
+                if (role === "user") {
+                    const userRoleConditions = [
+                        { role: "user" },
+                        { role: { $exists: false } },
+                        { role: null },
+                        { role: "" }
+                    ]
+                    if (query.$or) {
+                        query.$and = [{ $or: query.$or }, { $or: userRoleConditions }]
+                        delete query.$or
+                    } else {
+                        query.$or = userRoleConditions
+                    }
+                } else {
+                    query.role = role
+                }
             }
             const users = await userCollection.find(query).sort({ _id: -1 }).toArray()
             const allBookings = await bookingCollection.find().toArray()
@@ -658,6 +709,26 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 return res.status(400).send({ available: false, message: "Room is required" })
             }
 
+            // 1. Check Out of Order maintenance status
+            const roomDoc = toObjectId(roomId) ? await roomCollection.findOne({ _id: toObjectId(roomId) }) : null
+            const roomNo = roomDoc?.roomNo || roomId
+            const cleanRoomNo = String(roomNo).trim()
+
+            const activeOOO = await outOfOrderCollection.findOne({
+                status: "active",
+                roomNo: cleanRoomNo,
+                startDate: { $lt: checkOut },
+                endDate: { $gt: checkIn }
+            })
+
+            if (activeOOO) {
+                return res.send({
+                    available: false,
+                    message: `Room ${cleanRoomNo} is Out of Order for maintenance (${activeOOO.reason || "Maintenance"}) from ${activeOOO.startDate} to ${activeOOO.endDate}. Bookings cannot be made for this room.`
+                })
+            }
+
+            // 2. Check active booking conflicts
             const existingBooking = await findRoomConflict(bookingCollection, { roomId, checkIn, checkOut })
             if (existingBooking) {
                 const conflictingRoom = getBookingRooms(existingBooking).find(room =>
@@ -724,6 +795,17 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
                     if (category && Array.isArray(category.roomNumbers) && category.roomNumbers.length > 0) {
                         const totalCategoryRooms = category.roomNumbers.length
+                        const cleanRoomNumbers = category.roomNumbers.map(r => String(r).trim()).filter(Boolean)
+
+                        // Count active Out-of-Order maintenance rooms in this category for overlapping dates
+                        const oooRooms = await outOfOrderCollection.find({
+                            status: "active",
+                            roomNo: { $in: cleanRoomNumbers },
+                            startDate: { $lt: room.checkOut },
+                            endDate: { $gt: room.checkIn }
+                        }).toArray()
+                        const oooCount = oooRooms.length
+                        const effectiveTotalRooms = Math.max(0, totalCategoryRooms - oooCount)
 
                         // Count how many rooms in this request are for this category and overlapping dates
                         const requestedCount = rooms.filter(r => 
@@ -753,10 +835,11 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             alreadyBookedCount += matchingRooms.length
                         })
 
-                        if ((alreadyBookedCount + requestedCount) > totalCategoryRooms) {
-                            const remaining = Math.max(0, totalCategoryRooms - alreadyBookedCount)
+                        if ((alreadyBookedCount + requestedCount) > effectiveTotalRooms) {
+                            const remaining = Math.max(0, effectiveTotalRooms - alreadyBookedCount)
+                            const oooNotice = oooCount > 0 ? ` (${oooCount} room${oooCount > 1 ? 's' : ''} currently out of order for maintenance)` : ""
                             return res.status(409).send({
-                                message: `Category "${category.name}" only has ${remaining} room(s) available from ${room.checkIn} to ${room.checkOut}.`
+                                message: `Category "${category.name}" only has ${remaining} room(s) available${oooNotice} from ${room.checkIn} to ${room.checkOut}.`
                             })
                         }
                     }
@@ -810,6 +893,17 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 const today = new Date()
                 const requestedByRole = data.requestedByRole || data.role || "user"
                 const status = data.status || BOOKING_STATUS.REQUEST_BOOKING
+
+                // Physical room number is strictly required for any status beyond REQUEST_BOOKING
+                if (status !== BOOKING_STATUS.REQUEST_BOOKING && status !== BOOKING_STATUS.CANCEL) {
+                    const missingRoom = rooms.find(r => !r.roomNo || !String(r.roomNo).trim())
+                    if (missingRoom) {
+                        return res.status(400).send({
+                            message: `Physical room number is required for status "${status}". Please select room number(s).`
+                        })
+                    }
+                }
+
                 const expireHours = getRequestBookingExpireHours(requestedByRole)
                 const requestExpiresAt = status === BOOKING_STATUS.REQUEST_BOOKING ? new Date(today.getTime() + expireHours * 60 * 60 * 1000) : undefined
 
@@ -985,7 +1079,79 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
             const update = { $set: updateData }
 
+            // Validate rooms against Out of Order maintenance and conflicts
+            const targetRoomsForValidation = Array.isArray(rooms) && rooms.length > 0
+                ? rooms
+                : (status && status !== BOOKING_STATUS.CANCEL ? ((await bookingCollection.findOne(query))?.rooms || []) : [])
+
+            if (targetRoomsForValidation.length > 0 && status !== BOOKING_STATUS.CANCEL) {
+                for (const r of targetRoomsForValidation) {
+                    if (r.roomNo) {
+                        const cleanRoomNo = String(r.roomNo).trim()
+                        const checkIn = r.checkIn
+                        const checkOut = r.checkOut
+
+                        if (cleanRoomNo && checkIn && checkOut) {
+                            // 1. Check Out of Order
+                            const activeOOO = await outOfOrderCollection.findOne({
+                                status: "active",
+                                roomNo: cleanRoomNo,
+                                startDate: { $lt: checkOut },
+                                endDate: { $gt: checkIn }
+                            })
+
+                            if (activeOOO) {
+                                return res.status(409).send({
+                                    message: `Room ${cleanRoomNo} is Out of Order for maintenance (${activeOOO.reason || "Maintenance"}) from ${activeOOO.startDate} to ${activeOOO.endDate}. It cannot be assigned or confirmed.`
+                                })
+                            }
+
+                            // 2. Check room conflict with another active booking
+                            const existingConflict = await bookingCollection.findOne({
+                                _id: { $ne: query._id || (toObjectId(id) || id) },
+                                status: { $in: ACTIVE_BOOKING_STATUSES },
+                                $or: [
+                                    {
+                                        rooms: {
+                                            $elemMatch: {
+                                                roomNo: cleanRoomNo,
+                                                checkIn: { $lt: checkOut },
+                                                checkOut: { $gt: checkIn }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        roomNo: cleanRoomNo,
+                                        checkIn: { $lt: checkOut },
+                                        checkOut: { $gt: checkIn }
+                                    }
+                                ]
+                            })
+
+                            if (existingConflict) {
+                                return res.status(409).send({
+                                    message: `Room ${cleanRoomNo} is already occupied by booking ${existingConflict.bookingId} (${existingConflict.name}) for overlapping stay dates.`
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+
             if (status) {
+                // Physical room number is strictly required for any status beyond REQUEST_BOOKING
+                if (status !== BOOKING_STATUS.REQUEST_BOOKING && status !== BOOKING_STATUS.CANCEL) {
+                    const targetRooms = Array.isArray(rooms) && rooms.length > 0
+                        ? rooms
+                        : (await bookingCollection.findOne(query))?.rooms || []
+                    const missingRoom = targetRooms.find(r => !r.roomNo || !String(r.roomNo).trim())
+                    if (missingRoom) {
+                        return res.status(400).send({
+                            message: `Physical room number is required for status "${status}". Please assign room number(s).`
+                        })
+                    }
+                }
+
                 updateData.status = status
                 updateData.statusUpdatedAt = now
 
@@ -1082,9 +1248,10 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     }
                 })
 
-                const totalAmount = Number(booking.totalAmount || booking.total || roomRows.reduce((sum, r) => sum + r.total, 0))
-                const paidAmount = Number(booking.paidAmount || booking.advanceAmount || 0)
-                const dueAmount = Math.max(0, totalAmount - paidAmount)
+                const discountAmount = getBookingDiscount(booking)
+                const payableTotal = getBookingTotal(booking)
+                const paidAmount = getBookingPaidAmount(booking)
+                const dueAmount = getBookingDueAmount(booking)
 
                 const totalAdults = rawRooms.reduce((sum, r) => sum + Number(r.adults || 1), 0)
                 const totalChildren = rawRooms.reduce((sum, r) => sum + Number(r.babies || 0), 0)
@@ -1132,10 +1299,10 @@ startRequestBookingAutoCancelJob(bookingCollection)
                         },
                         rooms: roomRows,
                         financials: {
-                            totalAmount,
+                            totalAmount: payableTotal,
                             paidAmount,
                             dueAmount,
-                            discountAmount: Number(booking.discountAmount || 0),
+                            discountAmount,
                             paymentMethod: booking.paymentMethod || "M-Banking Advance"
                         },
                         reference: creator,
@@ -1204,6 +1371,13 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 if (!result) {
                     return res.status(404).send({ message: "Reservation not found." })
                 }
+
+                // Recalculate accurate dueAmount after payment increment
+                const netPayable = getBookingTotal(result)
+                const totalPaid = getBookingPaidAmount(result)
+                const newDue = Math.max(0, netPayable - totalPaid)
+                await bookingCollection.updateOne(query, { $set: { dueAmount: newDue } })
+                result.dueAmount = newDue
 
                 res.send(result)
             } catch (err) {
@@ -1377,42 +1551,62 @@ startRequestBookingAutoCancelJob(bookingCollection)
             const category = await categoryAndRoomCollection.findOne({ _id: catObjectId })
             if (!category) return res.status(404).send({ available: false, message: "Category not found" })
 
-            const roomNumbers = Array.isArray(category.roomNumbers) ? category.roomNumbers : []
-            if (roomNumbers.length === 0) {
+            const cleanRoomNumbers = (Array.isArray(category.roomNumbers) ? category.roomNumbers : [])
+                .map(r => String(r).trim())
+                .filter(Boolean)
+
+            if (cleanRoomNumbers.length === 0) {
                 return res.send({ available: true, message: "Category has rooms available." })
             }
 
-            // Find all rooms in the rooms collection matching these room numbers
-            const matchingRooms = await roomCollection.find({
-                roomNo: { $in: roomNumbers },
-                status: "active"
-            }).toArray()
-
-            if (matchingRooms.length === 0) {
-                // No rooms tracked in rooms collection — allow booking
-                return res.send({ available: true, message: "Category has rooms available." })
-            }
-
-            // For each room, check if it has an active booking conflicting with the dates
-            let anyAvailable = false
-            for (const room of matchingRooms) {
-                const conflict = await findRoomConflict(bookingCollection, {
-                    roomId: String(room._id),
-                    checkIn,
-                    checkOut
+            // For each physical room in category, check Out of Order and booking conflicts
+            let availableRoomCount = 0
+            for (const roomNo of cleanRoomNumbers) {
+                // 1. Check Out of Order maintenance
+                const isOOO = await outOfOrderCollection.findOne({
+                    status: "active",
+                    roomNo,
+                    startDate: { $lt: checkOut },
+                    endDate: { $gt: checkIn }
                 })
-                if (!conflict) {
-                    anyAvailable = true
-                    break
-                }
+                if (isOOO) continue
+
+                // 2. Check active booking reservations
+                const isBooked = await bookingCollection.findOne({
+                    status: { $in: ACTIVE_BOOKING_STATUSES },
+                    $or: [
+                        {
+                            rooms: {
+                                $elemMatch: {
+                                    roomNo,
+                                    checkIn: { $lt: checkOut },
+                                    checkOut: { $gt: checkIn }
+                                }
+                            }
+                        },
+                        {
+                            roomNo,
+                            checkIn: { $lt: checkOut },
+                            checkOut: { $gt: checkIn }
+                        }
+                    ]
+                })
+                if (isBooked) continue
+
+                availableRoomCount++
             }
 
-            if (anyAvailable) {
-                res.send({ available: true, message: "Rooms are available in this category for the selected dates." })
+            if (availableRoomCount > 0) {
+                res.send({ 
+                    available: true, 
+                    availableCount: availableRoomCount,
+                    message: `${availableRoomCount} room(s) available in this category for the selected dates.` 
+                })
             } else {
                 res.send({
                     available: false,
-                    message: `No rooms are available in this category from ${checkIn} to ${checkOut}. Please try different dates.`
+                    availableCount: 0,
+                    message: `No rooms are available in "${category.name}" from ${checkIn} to ${checkOut} (all rooms are reserved or out of order for maintenance).`
                 })
             }
         })
@@ -1639,6 +1833,11 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
                         categoryBreakdownMap[catLabel] = (categoryBreakdownMap[catLabel] || 0) + rTotal
 
+                        const bTotal = getBookingTotal(booking)
+                        const bPaid = getBookingPaidAmount(booking)
+                        const bDue = getBookingDueAmount(booking)
+                        const bDiscount = getBookingDiscount(booking)
+
                         detailedSellsList.push({
                             _id: booking._id,
                             bookingId: booking.bookingId,
@@ -1651,8 +1850,10 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             nights,
                             roomPrice: room.pricePerNight,
                             totalAmount: rTotal,
-                            bookingTotal: getBookingTotal(booking),
-                            paidAmount: Number(booking.paidAmount || 0),
+                            bookingTotal: bTotal,
+                            discountAmount: bDiscount,
+                            paidAmount: bPaid,
+                            dueAmount: bDue,
                             paymentMethod: booking.paymentMethod || booking.paymentHistory?.[0]?.paymentMethod || "Direct",
                             status: booking.status,
                             createdAt: booking.createdAt,
