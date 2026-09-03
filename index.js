@@ -482,12 +482,15 @@ startRequestBookingAutoCancelJob(bookingCollection)
             const enrichedUsers = users.map(u => {
                 const uEmail = String(u.email || "").trim().toLowerCase()
                 const uName = String(u.name || "").trim().toLowerCase()
+                const uUid = String(u.uid || "").trim()
 
                 const userBookings = allBookings.filter(b => {
                     const ref = String(b.reference || "").trim().toLowerCase()
                     const bEmail = String(b.userEmail || b.email || b.bookedBy?.email || b.createdBy?.email || "").trim().toLowerCase()
                     const bName = String(b.bookedBy?.name || b.createdBy?.name || "").trim().toLowerCase()
+                    const bBookedUid = String(b.bookedBy?.uid || b.createdBy?.uid || "").trim()
 
+                    if (uUid && bBookedUid && bBookedUid === uUid) return true
                     if (uEmail && (ref === uEmail || bEmail === uEmail || ref.includes(uEmail))) return true
                     if (uName && uName.length >= 2 && (ref === uName || bName === uName || ref.includes(uName))) return true
                     return false
@@ -536,6 +539,7 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
                 const uEmail = String(targetUser.email || "").trim().toLowerCase()
                 const uName = String(targetUser.name || "").trim().toLowerCase()
+                const uUid = String(targetUser.uid || "").trim()
 
                 const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
                 const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection, categoryAndRoomCollection)
@@ -544,7 +548,9 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     const ref = String(b.reference || "").trim().toLowerCase()
                     const bEmail = String(b.userEmail || b.email || b.bookedBy?.email || b.createdBy?.email || "").trim().toLowerCase()
                     const bName = String(b.bookedBy?.name || b.createdBy?.name || "").trim().toLowerCase()
+                    const bBookedUid = String(b.bookedBy?.uid || b.createdBy?.uid || "").trim()
 
+                    if (uUid && bBookedUid && bBookedUid === uUid) return true
                     if (uEmail && (ref === uEmail || bEmail === uEmail || ref.includes(uEmail))) return true
                     if (uName && uName.length >= 2 && (ref === uName || bName === uName || ref.includes(uName))) return true
                     return false
@@ -564,7 +570,8 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     if (Array.isArray(b.statusHistory)) {
                         b.statusHistory.forEach(hist => {
                             const act = hist.changedBy || {}
-                            if ((uEmail && act.email?.toLowerCase() === uEmail) || (uName && act.name?.toLowerCase() === uName)) {
+                            const actUid = String(act.uid || "").trim()
+                            if ((uUid && actUid && actUid === uUid) || (uEmail && act.email?.toLowerCase() === uEmail) || (uName && act.name?.toLowerCase() === uName)) {
                                 activityLogs.push({
                                     type: "status_change",
                                     bookingId: b.bookingId,
@@ -580,7 +587,8 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     if (Array.isArray(b.paymentHistory)) {
                         b.paymentHistory.forEach(pay => {
                             const col = pay.collectedBy || {}
-                            if ((uEmail && col.email?.toLowerCase() === uEmail) || (uName && col.name?.toLowerCase() === uName)) {
+                            const colUid = String(col.uid || "").trim()
+                            if ((uUid && colUid && colUid === uUid) || (uEmail && col.email?.toLowerCase() === uEmail) || (uName && col.name?.toLowerCase() === uName)) {
                                 activityLogs.push({
                                     type: "payment_collection",
                                     bookingId: b.bookingId,
@@ -981,14 +989,28 @@ startRequestBookingAutoCancelJob(bookingCollection)
             const { email, status, reference, search, skip, limit } = req.query
             let query = {}
             let sort = { _id: -1 }
-            if (email) query.userEmail = email
+            if (email) {
+                const emailRegex = { $regex: `^${email}$`, $options: "i" }
+                const emailFilters = [
+                    { userEmail: emailRegex },
+                    { "bookedBy.email": emailRegex },
+                    { "createdBy.email": emailRegex }
+                ]
+                query.$or = emailFilters
+            }
             if (reference) {
-                query.$or = [
+                const refFilters = [
                     { reference: { $regex: reference, $options: "i" } },
                     { "bookedBy.name": { $regex: reference, $options: "i" } },
                     { "bookedBy.email": { $regex: reference, $options: "i" } },
                     { "createdBy.name": { $regex: reference, $options: "i" } }
                 ]
+                if (query.$or) {
+                    query.$and = [{ $or: query.$or }, { $or: refFilters }]
+                    delete query.$or
+                } else {
+                    query.$or = refFilters
+                }
             }
             if (status) {
                 if (Array.isArray(status)) {
@@ -1152,6 +1174,21 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     }
                 }
 
+                // Check-out requires full payment
+                if (status === BOOKING_STATUS.CHECKED_OUT || status === "checked_out") {
+                    const currentDoc = await bookingCollection.findOne(query)
+                    if (currentDoc) {
+                        const effectiveTotal = getBookingTotal({ ...currentDoc, ...updateData })
+                        const effectivePaid = updateData.paidAmount !== undefined ? updateData.paidAmount : getBookingPaidAmount(currentDoc)
+                        const remainingDue = Math.max(0, effectiveTotal - effectivePaid)
+                        if (remainingDue > 0.01) {
+                            return res.status(400).send({
+                                message: `Cannot check out: Outstanding balance of ৳${remainingDue.toLocaleString()} is remaining. Please complete full payment before checking out.`
+                            })
+                        }
+                    }
+                }
+
                 updateData.status = status
                 updateData.statusUpdatedAt = now
 
@@ -1183,6 +1220,36 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     updateData.cancelledAt = now
                     updateData.cancelReason = cancelReason || "No reason provided"
                     updateData.cancelledBy = actorInfo
+                }
+            }
+
+            // Record payment entry in paymentHistory if paidAmount was recorded/increased
+            if (updateData.paidAmount !== undefined) {
+                const currentDoc = await bookingCollection.findOne(query)
+                if (currentDoc) {
+                    const prevPaid = Number(currentDoc.paidAmount !== undefined ? currentDoc.paidAmount : (currentDoc.advanceAmount || 0))
+                    const newPaid = Number(updateData.paidAmount)
+                    const diff = newPaid - prevPaid
+                    if (diff > 0) {
+                        const actorInfo = changedBy || {
+                            email: req.decodedEmail || "",
+                            name: req.body.changedByName || "Staff / Admin",
+                            role: requestedByRole || "admin"
+                        }
+                        const method = req.body.paymentMethod || updateData.paymentMethod || currentDoc.paymentMethod || "Cash"
+                        const trx = updateData.transactionId || (method === "Cash" ? "Cash / Direct" : "")
+                        const payEntry = {
+                            amount: diff,
+                            paymentMethod: method,
+                            reference: updateData.reference || currentDoc.reference || "",
+                            transactionId: trx,
+                            note: updateData.notes || `Payment of ৳${diff.toLocaleString()} recorded`,
+                            date: now,
+                            collectedBy: actorInfo
+                        }
+                        if (!update.$push) update.$push = {}
+                        update.$push.paymentHistory = payEntry
+                    }
                 }
             }
 
@@ -1303,8 +1370,10 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             paidAmount,
                             dueAmount,
                             discountAmount,
-                            paymentMethod: booking.paymentMethod || "M-Banking Advance"
+                            paymentMethod: booking.paymentMethod || "M-Banking Advance",
+                            paymentHistory: Array.isArray(booking.paymentHistory) ? booking.paymentHistory : []
                         },
+                        paymentHistory: Array.isArray(booking.paymentHistory) ? booking.paymentHistory : [],
                         reference: creator,
                         notes: booking.notes || ""
                     }
@@ -1724,54 +1793,96 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
         // Detailed Income Analytics
         app.get("/admin/income-breakdown", verifyFBToken, verifyAdmin, async (req, res) => {
-            const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
-            const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
-            const confirmedBookings = hydratedBookings.filter(booking =>
-                [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
-            )
+            try {
+                const { startDate, endDate } = req.query
+                const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
+                const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
+                
+                let confirmedBookings = hydratedBookings.filter(booking =>
+                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
+                )
 
-            const roomStats = {}
-            confirmedBookings.forEach(booking => {
-                const rooms = getBookingRooms(booking)
-                rooms.forEach(room => {
-                    const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
-                    if (!roomStats[label]) {
-                        roomStats[label] = {
-                            roomName: label,
-                            totalRevenue: 0,
-                            bookingCount: 0,
-                            totalNights: 0,
-                            bookings: []
+                if (startDate || endDate) {
+                    confirmedBookings = confirmedBookings.filter(booking => {
+                        const rooms = getBookingRooms(booking)
+                        return rooms.some(r => {
+                            const cIn = r.checkIn ? String(r.checkIn).slice(0, 10) : ""
+                            const cOut = r.checkOut ? String(r.checkOut).slice(0, 10) : ""
+                            if (startDate && endDate) {
+                                return (cIn <= endDate && cOut >= startDate)
+                            } else if (startDate) {
+                                return cOut >= startDate
+                            } else if (endDate) {
+                                return cIn <= endDate
+                            }
+                            return true
+                        })
+                    })
+                }
+
+                const roomStats = {}
+                confirmedBookings.forEach(booking => {
+                    const rooms = getBookingRooms(booking)
+                    rooms.forEach(room => {
+                        const cIn = room.checkIn ? String(room.checkIn).slice(0, 10) : ""
+                        const cOut = room.checkOut ? String(room.checkOut).slice(0, 10) : ""
+                        
+                        if (startDate && endDate) {
+                            if (!(cIn <= endDate && cOut >= startDate)) return
+                        } else if (startDate) {
+                            if (!(cOut >= startDate)) return
+                        } else if (endDate) {
+                            if (!(cIn <= endDate)) return
                         }
-                    }
-                    const nights = getNightCount(room.checkIn, room.checkOut)
-                    const rTotal = getRoomTotal(room)
-                    roomStats[label].totalRevenue += rTotal
-                    roomStats[label].bookingCount += 1
-                    roomStats[label].totalNights += nights
-                    roomStats[label].bookings.push({
-                        bookingId: booking.bookingId,
-                        _id: booking._id,
-                        guestName: booking.name,
-                        guestPhone: booking.mobile,
-                        roomNo: room.roomNo || "",
-                        checkIn: room.checkIn,
-                        checkOut: room.checkOut,
-                        nights,
-                        amount: rTotal,
-                        reference: booking.reference || "",
-                        transactionId: booking.transactionId || "",
-                        status: booking.status,
-                        createdAt: booking.createdAt
+
+                        const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
+                        if (!roomStats[label]) {
+                            roomStats[label] = {
+                                roomName: label,
+                                totalRevenue: 0,
+                                bookingCount: 0,
+                                totalNights: 0,
+                                bookings: []
+                            }
+                        }
+                        const nights = getNightCount(room.checkIn, room.checkOut)
+                        const rTotal = getRoomTotal(room)
+                        roomStats[label].totalRevenue += rTotal
+                        roomStats[label].bookingCount += 1
+                        roomStats[label].totalNights += nights
+                        roomStats[label].bookings.push({
+                            bookingId: booking.bookingId,
+                            _id: booking._id,
+                            guestName: booking.name,
+                            guestPhone: booking.mobile,
+                            roomNo: room.roomNo || "",
+                            checkIn: room.checkIn,
+                            checkOut: room.checkOut,
+                            nights,
+                            amount: rTotal,
+                            reference: booking.reference || "",
+                            transactionId: booking.transactionId || "",
+                            status: booking.status,
+                            createdAt: booking.createdAt
+                        })
                     })
                 })
-            })
 
-            res.send({
-                totalRevenue: confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0),
-                totalConfirmedBookings: confirmedBookings.length,
-                roomBreakdown: Object.values(roomStats).sort((a, b) => b.totalRevenue - a.totalRevenue)
-            })
+                const totalRevenue = confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+
+                res.send({
+                    totalRevenue,
+                    totalConfirmedBookings: confirmedBookings.length,
+                    roomBreakdown: Object.values(roomStats).sort((a, b) => b.totalRevenue - a.totalRevenue),
+                    filter: {
+                        startDate: startDate || null,
+                        endDate: endDate || null
+                    }
+                })
+            } catch (err) {
+                console.error("Income breakdown error:", err)
+                res.status(500).send({ message: "Failed to load income breakdown" })
+            }
         })
 
         // Staff / Agent / Manager Role Sells Overview & Detailed Breakdown
