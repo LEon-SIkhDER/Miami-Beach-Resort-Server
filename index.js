@@ -166,12 +166,14 @@ const getRoomTotal = (room = {}) => {
 }
 
 const getBookingSubtotal = (booking = {}) => {
+    const extraCost = Number(booking.extraServiceCost || 0)
     const rooms = getBookingRooms(booking)
     if (rooms.length) {
         const total = rooms.reduce((sum, room) => sum + getRoomTotal(room), 0)
-        if (total > 0) return total
+        if (total > 0) return total + extraCost
     }
-    return Number(booking.subtotal || booking.standardTotal || booking.totalAmount || 0)
+    const base = Number(booking.subtotal || booking.standardTotal || booking.totalAmount || 0)
+    return base > 0 ? base + extraCost : 0
 }
 
 const getBookingDiscount = (booking = {}) => {
@@ -945,6 +947,8 @@ startRequestBookingAutoCancelJob(bookingCollection)
                         date: today,
                         collectedBy: actorInfo
                     }] : [],
+                    extraService: data.extraService || "",
+                    extraServiceCost: Number(data.extraServiceCost || 0),
                     reference: resolvedReference,
                     bookedBy: data.bookedBy || actorInfo,
                     createdBy: data.createdBy || actorInfo,
@@ -1097,6 +1101,8 @@ startRequestBookingAutoCancelJob(bookingCollection)
             if (reference !== undefined) updateData.reference = reference
             if (transactionId !== undefined) updateData.transactionId = transactionId
             if (notes !== undefined) updateData.notes = notes
+            if (req.body.extraService !== undefined) updateData.extraService = req.body.extraService
+            if (req.body.extraServiceCost !== undefined) updateData.extraServiceCost = Number(req.body.extraServiceCost || 0)
             if (req.body.paymentMethod !== undefined) updateData.paymentMethod = req.body.paymentMethod
 
             const update = { $set: updateData }
@@ -1171,6 +1177,58 @@ startRequestBookingAutoCancelJob(bookingCollection)
                         return res.status(400).send({
                             message: `Physical room number is required for status "${status}". Please assign room number(s).`
                         })
+                    }
+                }
+
+                // Strict validation when confirming booking or checking in
+                const isConfirmedStatus = [
+                    BOOKING_STATUS.BOOKING_CONFIRMED, 
+                    "booking_confirmed", 
+                    BOOKING_STATUS.CHECKED_IN, 
+                    "checked_id", 
+                    "checked_in", 
+                    BOOKING_STATUS.CHECKED_OUT, 
+                    "checked_out", 
+                    "confirmed"
+                ].includes(status)
+
+                if (isConfirmedStatus) {
+                    const currentDoc = await bookingCollection.findOne(query)
+                    const targetRooms = Array.isArray(rooms) && rooms.length > 0 ? rooms : (currentDoc?.rooms || [])
+                    
+                    const effectiveName = updateData.name || currentDoc?.name
+                    const effectiveMobile = updateData.mobile || currentDoc?.mobile
+                    if (!effectiveName || !String(effectiveName).trim()) {
+                        return res.status(400).send({ message: "Guest Full Name is required for confirmed bookings." })
+                    }
+                    if (!effectiveMobile || !String(effectiveMobile).trim()) {
+                        return res.status(400).send({ message: "Guest Mobile / WhatsApp number is required for confirmed bookings." })
+                    }
+
+                    const missingAdult = targetRooms.find(r => !r.adults || Number(r.adults) <= 0)
+                    if (missingAdult) {
+                        return res.status(400).send({ message: "Adult guest count is required for all rooms for confirmed bookings." })
+                    }
+
+                    const effectivePaid = updateData.paidAmount !== undefined ? updateData.paidAmount : (currentDoc?.paidAmount || 0)
+                    if (effectivePaid <= 0) {
+                        return res.status(400).send({ message: "Payment Done amount is required for confirmed bookings." })
+                    }
+
+                    const effectiveMethod = updateData.paymentMethod || currentDoc?.paymentMethod
+                    if (!effectiveMethod || !String(effectiveMethod).trim()) {
+                        return res.status(400).send({ message: "Payment Method is required for confirmed bookings." })
+                    }
+
+                    const isDigitalMethod = !["Cash", "Other"].includes(String(effectiveMethod).trim())
+                    const effectiveTrx = updateData.transactionId !== undefined ? updateData.transactionId : (currentDoc?.transactionId || "")
+                    if (isDigitalMethod && (!effectiveTrx || !String(effectiveTrx).trim())) {
+                        return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${effectiveMethod}.` })
+                    }
+
+                    const effectiveRef = updateData.reference !== undefined ? updateData.reference : (currentDoc?.reference || "")
+                    if (!effectiveRef || !String(effectiveRef).trim()) {
+                        return res.status(400).send({ message: "Staff / Admin Reference is required for confirmed bookings." })
                     }
                 }
 
@@ -1370,9 +1428,13 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             paidAmount,
                             dueAmount,
                             discountAmount,
+                            extraService: booking.extraService || "",
+                            extraServiceCost: Number(booking.extraServiceCost || 0),
                             paymentMethod: booking.paymentMethod || "M-Banking Advance",
                             paymentHistory: Array.isArray(booking.paymentHistory) ? booking.paymentHistory : []
                         },
+                        extraService: booking.extraService || "",
+                        extraServiceCost: Number(booking.extraServiceCost || 0),
                         paymentHistory: Array.isArray(booking.paymentHistory) ? booking.paymentHistory : [],
                         reference: creator,
                         notes: booking.notes || ""
@@ -1862,6 +1924,13 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             amount: rTotal,
                             reference: booking.reference || "",
                             transactionId: booking.transactionId || "",
+                            paymentMethod: booking.paymentMethod || "",
+                            paidAmount: Number(booking.paidAmount || 0),
+                            dueAmount: Number(booking.dueAmount || 0),
+                            extraService: booking.extraService || "",
+                            extraServiceCost: Number(booking.extraServiceCost || 0),
+                            requestedByRole: booking.requestedByRole || booking.changedBy?.role || "",
+                            bookedBy: booking.bookedBy || booking.createdBy || booking.changedBy || null,
                             status: booking.status,
                             createdAt: booking.createdAt
                         })
