@@ -209,6 +209,39 @@ const getBookingDueAmount = (booking = {}) => {
     return Math.max(0, payableTotal - paid)
 }
 
+const CONFIRMED_STATUSES = [
+    BOOKING_STATUS.BOOKING_CONFIRMED,
+    BOOKING_STATUS.CHECKED_IN,
+    BOOKING_STATUS.CHECKED_OUT,
+    "booking_confirmed",
+    "checked_id",
+    "checked_in",
+    "checked_out",
+    "confirmed"
+]
+
+const CANCEL_STATUSES = [
+    BOOKING_STATUS.CANCEL,
+    "cancel",
+    "cancelled"
+]
+
+const isRevenueBooking = (booking = {}) => {
+    if (CONFIRMED_STATUSES.includes(booking.status)) return true
+    if (CANCEL_STATUSES.includes(booking.status) && Number(booking.paidAmount || 0) > 0) return true
+    return false
+}
+
+const getBookingRevenue = (booking = {}) => {
+    if (CANCEL_STATUSES.includes(booking.status)) {
+        return Number(booking.paidAmount || 0)
+    }
+    if (CONFIRMED_STATUSES.includes(booking.status)) {
+        return getBookingTotal(booking)
+    }
+    return 0
+}
+
 const getRoomIdsForLookup = (bookings = []) => {
     return [...new Set(bookings.flatMap(booking => getBookingRooms(booking).map(room => room.roomId).filter(Boolean)))]
 }
@@ -498,11 +531,9 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     return false
                 })
 
-                const confirmedBookings = userBookings.filter(b => 
-                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(b.status)
-                )
+                const confirmedBookings = userBookings.filter(isRevenueBooking)
 
-                const totalSales = confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const totalSales = confirmedBookings.reduce((sum, b) => sum + getBookingRevenue(b), 0)
                 const totalPaid = confirmedBookings.reduce((sum, b) => sum + Number(b.paidAmount || 0), 0)
                 const totalDue = Math.max(0, totalSales - totalPaid)
 
@@ -558,11 +589,9 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     return false
                 })
 
-                const confirmedBookings = userBookings.filter(b => 
-                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(b.status)
-                )
+                const confirmedBookings = userBookings.filter(isRevenueBooking)
 
-                const totalSales = confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const totalSales = confirmedBookings.reduce((sum, b) => sum + getBookingRevenue(b), 0)
                 const totalPaid = confirmedBookings.reduce((sum, b) => sum + Number(b.paidAmount || 0), 0)
                 const totalDue = Math.max(0, totalSales - totalPaid)
 
@@ -914,6 +943,50 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     }
                 }
 
+                // Strict validation when creating a confirmed reservation directly
+                const isConfirmedStatus = [
+                    BOOKING_STATUS.BOOKING_CONFIRMED,
+                    "booking_confirmed",
+                    BOOKING_STATUS.CHECKED_IN,
+                    "checked_id",
+                    "checked_in",
+                    BOOKING_STATUS.CHECKED_OUT,
+                    "checked_out",
+                    "confirmed"
+                ].includes(status)
+
+                if (isConfirmedStatus) {
+                    if (!data.name || !String(data.name).trim()) {
+                        return res.status(400).send({ message: "Guest Full Name is required for confirmed bookings." })
+                    }
+                    if (!data.mobile || !String(data.mobile).trim()) {
+                        return res.status(400).send({ message: "Guest Mobile number is required for confirmed bookings." })
+                    }
+
+                    const missingAdult = rooms.find(r => !r.adults || Number(r.adults) <= 0)
+                    if (missingAdult) {
+                        return res.status(400).send({ message: "Adult guest count is required for all rooms for confirmed bookings." })
+                    }
+
+                    const effectivePaid = Number(data.paidAmount !== undefined ? data.paidAmount : (data.advanceAmount || 0))
+                    if (isNaN(effectivePaid) || effectivePaid < 0) {
+                        return res.status(400).send({ message: "Payment Done amount must be greater than 0 for confirmed bookings." })
+                    }
+
+                    if (!data.paymentMethod || !String(data.paymentMethod).trim()) {
+                        return res.status(400).send({ message: "Payment Method is required for confirmed bookings." })
+                    }
+
+                    const isDigitalMethod = !["Cash", "Other"].includes(String(data.paymentMethod).trim())
+                    if (isDigitalMethod && (!data.transactionId || !String(data.transactionId).trim())) {
+                        return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${data.paymentMethod}.` })
+                    }
+
+                    if (!data.reference || !String(data.reference).trim()) {
+                        return res.status(400).send({ message: "Staff / Admin Reference is required for confirmed bookings." })
+                    }
+                }
+
                 const expireHours = getRequestBookingExpireHours(requestedByRole)
                 const requestExpiresAt = status === BOOKING_STATUS.REQUEST_BOOKING ? new Date(today.getTime() + expireHours * 60 * 60 * 1000) : undefined
 
@@ -1210,9 +1283,9 @@ startRequestBookingAutoCancelJob(bookingCollection)
                         return res.status(400).send({ message: "Adult guest count is required for all rooms for confirmed bookings." })
                     }
 
-                    const effectivePaid = updateData.paidAmount !== undefined ? updateData.paidAmount : (currentDoc?.paidAmount || 0)
-                    if (effectivePaid <= 0) {
-                        return res.status(400).send({ message: "Payment Done amount is required for confirmed bookings." })
+                    const effectivePaid = Number(updateData.paidAmount !== undefined ? updateData.paidAmount : (currentDoc?.paidAmount || 0))
+                    if (isNaN(effectivePaid) || effectivePaid < 0) {
+                        return res.status(400).send({ message: "Payment Done amount must be greater than 0 for confirmed bookings." })
                     }
 
                     const effectiveMethod = updateData.paymentMethod || currentDoc?.paymentMethod
@@ -1274,10 +1347,42 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     update.$unset = { requestExpiresAt: "" }
                 }
 
-                if (status === BOOKING_STATUS.CANCEL) {
+                if (status === BOOKING_STATUS.CANCEL || status === "cancel") {
                     updateData.cancelledAt = now
                     updateData.cancelReason = cancelReason || "No reason provided"
                     updateData.cancelledBy = actorInfo
+
+                    const currentDoc = await bookingCollection.findOne(query)
+                    if (currentDoc) {
+                        const prevPaid = Number(currentDoc.paidAmount !== undefined ? currentDoc.paidAmount : (currentDoc.advanceAmount || 0))
+                        const refundAmt = Number(req.body.refundAmount || 0)
+
+                        if (refundAmt > 0) {
+                            if (refundAmt > prevPaid) {
+                                return res.status(400).send({
+                                    message: `Refund amount (৳${refundAmt.toLocaleString()}) cannot exceed total paid amount (৳${prevPaid.toLocaleString()}).`
+                                })
+                            }
+                            updateData.refundAmount = refundAmt
+                            const newPaid = Math.max(0, prevPaid - refundAmt)
+                            updateData.paidAmount = newPaid
+                            updateData.dueAmount = Math.max(0, getBookingTotal(currentDoc) - newPaid)
+
+                            const refundEntry = {
+                                amount: -refundAmt,
+                                refundAmount: refundAmt,
+                                paymentMethod: req.body.refundPaymentMethod || req.body.paymentMethod || "Refund",
+                                reference: updateData.reference || currentDoc.reference || "",
+                                transactionId: req.body.refundTransactionId || updateData.transactionId || "",
+                                note: `Refund of ৳${refundAmt.toLocaleString()} issued upon cancellation. Reason: ${cancelReason || "Cancellation"}`,
+                                date: now,
+                                collectedBy: actorInfo
+                            }
+                            if (!update.$push) update.$push = {}
+                            update.$push.paymentHistory = refundEntry
+                            historyItem.note = `${cancelReason || "Reservation cancelled"} (Refunded: ৳${refundAmt.toLocaleString()})`
+                        }
+                    }
                 }
             }
 
@@ -1459,6 +1564,25 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     return res.status(400).send({ message: "Valid payment amount is required." })
                 }
 
+                const objectId = toObjectId(id)
+                const query = objectId ? { _id: objectId } : { bookingId: id }
+
+                const booking = await bookingCollection.findOne(query)
+                if (!booking) {
+                    return res.status(404).send({ message: "Reservation not found." })
+                }
+
+                const currentDue = getBookingDueAmount(booking)
+                if (currentDue <= 0) {
+                    return res.status(400).send({ message: "This reservation has no outstanding due balance." })
+                }
+
+                if (payAmount > currentDue) {
+                    return res.status(400).send({
+                        message: `Payment amount (৳${payAmount.toLocaleString()}) cannot be greater than the current due balance (৳${currentDue.toLocaleString()}).`
+                    })
+                }
+
                 const now = new Date()
                 const actorInfo = collectedBy || {
                     email: req.decodedEmail || "",
@@ -1483,9 +1607,6 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     note: `Collected due payment of ৳${payAmount.toLocaleString()} via ${paymentMethod || "Cash"}${transactionId ? ` (Trx: ${transactionId})` : ""}`
                 }
 
-                const objectId = toObjectId(id)
-                const query = objectId ? { _id: objectId } : { bookingId: id }
-                
                 const result = await bookingCollection.findOneAndUpdate(
                     query,
                     {
@@ -1498,10 +1619,6 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     },
                     { returnDocument: "after" }
                 )
-
-                if (!result) {
-                    return res.status(404).send({ message: "Reservation not found." })
-                }
 
                 // Recalculate accurate dueAmount after payment increment
                 const netPayable = getBookingTotal(result)
@@ -1798,13 +1915,11 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
             const allBookings = await bookingCollection.find().toArray()
             const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
-            const confirmedBookings = hydratedBookings.filter(booking =>
-                [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
-            )
-            const totalRevenue = confirmedBookings.reduce((total, booking) => total + getBookingTotal(booking), 0)
+            const revenueBookings = hydratedBookings.filter(isRevenueBooking)
+            const totalRevenue = revenueBookings.reduce((total, booking) => total + getBookingRevenue(booking), 0)
 
-            const monthlyConfirmedBookings = confirmedBookings.filter(booking => {
-                const bookingDate = booking.createdAt ? new Date(booking.createdAt) : null
+            const monthlyRevenueBookings = revenueBookings.filter(booking => {
+                const bookingDate = booking.cancelledAt ? new Date(booking.cancelledAt) : (booking.createdAt ? new Date(booking.createdAt) : null)
                 if (bookingDate && bookingDate >= currentMonthStart && bookingDate <= currentMonthEnd) return true
                 const firstRoom = getBookingRooms(booking)[0]
                 if (firstRoom?.checkIn) {
@@ -1813,18 +1928,33 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 }
                 return false
             })
-            const monthlyRevenue = monthlyConfirmedBookings.reduce((total, booking) => total + getBookingTotal(booking), 0)
+            const monthlyRevenue = monthlyRevenueBookings.reduce((total, booking) => total + getBookingRevenue(booking), 0)
 
             const roomCountMap = {}
             const roomRevenueMap = {}
 
-            confirmedBookings.forEach(booking => {
+            revenueBookings.forEach(booking => {
+                const isCancelled = CANCEL_STATUSES.includes(booking.status)
                 const rooms = getBookingRooms(booking)
-                rooms.forEach(room => {
-                    const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
-                    roomCountMap[label] = (roomCountMap[label] || 0) + 1
-                    roomRevenueMap[label] = (roomRevenueMap[label] || 0) + getRoomTotal(room)
-                })
+                if (!rooms.length) return
+
+                if (isCancelled) {
+                    const retainedPaid = Number(booking.paidAmount || 0)
+                    if (retainedPaid > 0) {
+                        const totalRoomPrice = rooms.reduce((sum, r) => sum + (getRoomTotal(r) || 1), 0) || 1
+                        rooms.forEach(room => {
+                            const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
+                            const portion = ((getRoomTotal(room) || 1) / totalRoomPrice) * retainedPaid
+                            roomRevenueMap[label] = (roomRevenueMap[label] || 0) + portion
+                        })
+                    }
+                } else {
+                    rooms.forEach(room => {
+                        const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
+                        roomCountMap[label] = (roomCountMap[label] || 0) + 1
+                        roomRevenueMap[label] = (roomRevenueMap[label] || 0) + getRoomTotal(room)
+                    })
+                }
             })
 
             const bookingsPerRoom = Object.entries(roomCountMap)
@@ -1860,12 +1990,23 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
                 const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
                 
-                let confirmedBookings = hydratedBookings.filter(booking =>
-                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
-                )
+                let revenueBookings = hydratedBookings.filter(isRevenueBooking)
 
                 if (startDate || endDate) {
-                    confirmedBookings = confirmedBookings.filter(booking => {
+                    revenueBookings = revenueBookings.filter(booking => {
+                        const isCancelled = CANCEL_STATUSES.includes(booking.status)
+                        const cancelDate = booking.cancelledAt ? String(booking.cancelledAt).slice(0, 10) : ""
+
+                        if (isCancelled && cancelDate) {
+                            if (startDate && endDate) {
+                                if (cancelDate >= startDate && cancelDate <= endDate) return true
+                            } else if (startDate && cancelDate >= startDate) {
+                                return true
+                            } else if (endDate && cancelDate <= endDate) {
+                                return true
+                            }
+                        }
+
                         const rooms = getBookingRooms(booking)
                         return rooms.some(r => {
                             const cIn = r.checkIn ? String(r.checkIn).slice(0, 10) : ""
@@ -1883,8 +2024,12 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 }
 
                 const roomStats = {}
-                confirmedBookings.forEach(booking => {
+                revenueBookings.forEach(booking => {
+                    const isCancelled = CANCEL_STATUSES.includes(booking.status)
                     const rooms = getBookingRooms(booking)
+                    const retainedPaid = Number(booking.paidAmount || 0)
+                    const totalRoomPrice = rooms.reduce((sum, r) => sum + (getRoomTotal(r) || 1), 0) || 1
+
                     rooms.forEach(room => {
                         const cIn = room.checkIn ? String(room.checkIn).slice(0, 10) : ""
                         const cOut = room.checkOut ? String(room.checkOut).slice(0, 10) : ""
@@ -1908,7 +2053,10 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             }
                         }
                         const nights = getNightCount(room.checkIn, room.checkOut)
-                        const rTotal = getRoomTotal(room)
+                        const rTotal = isCancelled
+                            ? (((getRoomTotal(room) || 1) / totalRoomPrice) * retainedPaid)
+                            : getRoomTotal(room)
+
                         roomStats[label].totalRevenue += rTotal
                         roomStats[label].bookingCount += 1
                         roomStats[label].totalNights += nights
@@ -1925,23 +2073,25 @@ startRequestBookingAutoCancelJob(bookingCollection)
                             reference: booking.reference || "",
                             transactionId: booking.transactionId || "",
                             paymentMethod: booking.paymentMethod || "",
-                            paidAmount: Number(booking.paidAmount || 0),
-                            dueAmount: Number(booking.dueAmount || 0),
+                            paidAmount: isCancelled ? retainedPaid : Number(booking.paidAmount || 0),
+                            dueAmount: isCancelled ? 0 : Number(booking.dueAmount || 0),
                             extraService: booking.extraService || "",
                             extraServiceCost: Number(booking.extraServiceCost || 0),
                             requestedByRole: booking.requestedByRole || booking.changedBy?.role || "",
                             bookedBy: booking.bookedBy || booking.createdBy || booking.changedBy || null,
                             status: booking.status,
-                            createdAt: booking.createdAt
+                            createdAt: booking.createdAt,
+                            cancelReason: booking.cancelReason || "",
+                            refundAmount: Number(booking.refundAmount || 0)
                         })
                     })
                 })
 
-                const totalRevenue = confirmedBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const totalRevenue = revenueBookings.reduce((sum, b) => sum + getBookingRevenue(b), 0)
 
                 res.send({
                     totalRevenue,
-                    totalConfirmedBookings: confirmedBookings.length,
+                    totalConfirmedBookings: revenueBookings.length,
                     roomBreakdown: Object.values(roomStats).sort((a, b) => b.totalRevenue - a.totalRevenue),
                     filter: {
                         startDate: startDate || null,
@@ -1980,16 +2130,14 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 }
 
                 const myBookings = hydratedBookings.filter(isUserOrRoleMatched)
-                const confirmedMyBookings = myBookings.filter(booking =>
-                    [BOOKING_STATUS.BOOKING_CONFIRMED, BOOKING_STATUS.CHECKED_IN, BOOKING_STATUS.CHECKED_OUT, "confirmed"].includes(booking.status)
-                )
+                const confirmedMyBookings = myBookings.filter(isRevenueBooking)
 
-                const totalSales = confirmedMyBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const totalSales = confirmedMyBookings.reduce((sum, b) => sum + getBookingRevenue(b), 0)
                 const totalPaid = confirmedMyBookings.reduce((sum, b) => sum + Number(b.paidAmount || 0), 0)
                 const totalDue = Math.max(0, totalSales - totalPaid)
 
                 const monthlyBookings = confirmedMyBookings.filter(b => {
-                    const bDate = b.createdAt ? new Date(b.createdAt) : null
+                    const bDate = b.cancelledAt ? new Date(b.cancelledAt) : (b.createdAt ? new Date(b.createdAt) : null)
                     if (bDate && bDate >= currentMonthStart && bDate <= currentMonthEnd) return true
                     const firstRoom = getBookingRooms(b)[0]
                     if (firstRoom?.checkIn) {
@@ -1998,25 +2146,31 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     }
                     return false
                 })
-                const monthlySales = monthlyBookings.reduce((sum, b) => sum + getBookingTotal(b), 0)
+                const monthlySales = monthlyBookings.reduce((sum, b) => sum + getBookingRevenue(b), 0)
 
                 // Category & Room Breakdown for this user/agent
                 const categoryBreakdownMap = {}
                 const detailedSellsList = []
 
                 confirmedMyBookings.forEach(booking => {
+                    const isCancelled = CANCEL_STATUSES.includes(booking.status)
                     const rooms = getBookingRooms(booking)
+                    const retainedPaid = Number(booking.paidAmount || 0)
+                    const totalRoomPrice = rooms.reduce((sum, r) => sum + (getRoomTotal(r) || 1), 0) || 1
+
                     rooms.forEach(room => {
                         const catLabel = room.categoryName || room.room?.name || room.room?.category || "Standard Room"
-                        const rTotal = getRoomTotal(room)
+                        const rTotal = isCancelled
+                            ? (((getRoomTotal(room) || 1) / totalRoomPrice) * retainedPaid)
+                            : getRoomTotal(room)
                         const nights = getNightCount(room.checkIn, room.checkOut)
 
                         categoryBreakdownMap[catLabel] = (categoryBreakdownMap[catLabel] || 0) + rTotal
 
-                        const bTotal = getBookingTotal(booking)
-                        const bPaid = getBookingPaidAmount(booking)
-                        const bDue = getBookingDueAmount(booking)
-                        const bDiscount = getBookingDiscount(booking)
+                        const bTotal = getBookingRevenue(booking)
+                        const bPaid = isCancelled ? retainedPaid : getBookingPaidAmount(booking)
+                        const bDue = isCancelled ? 0 : getBookingDueAmount(booking)
+                        const bDiscount = isCancelled ? 0 : getBookingDiscount(booking)
 
                         detailedSellsList.push({
                             _id: booking._id,
