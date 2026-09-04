@@ -1062,6 +1062,67 @@ startRequestBookingAutoCancelJob(bookingCollection)
         app.post("/bookings", handleCreateBooking)
         app.post("/booking", handleCreateBooking)
 
+        // Public Guest Lookup endpoint (fetches bookings matching stored localStorage IDs)
+        app.post("/bookings/by-ids", async (req, res) => {
+            try {
+                const { bookingIds } = req.body
+                if (!Array.isArray(bookingIds) || bookingIds.length === 0) {
+                    return res.send([])
+                }
+                const cleanIds = bookingIds.map(id => String(id).trim()).filter(Boolean)
+                if (cleanIds.length === 0) {
+                    return res.send([])
+                }
+                const docs = await bookingCollection.find({ bookingId: { $in: cleanIds } }).sort({ _id: -1 }).toArray()
+                const hydrated = await hydrateBookingsWithRooms(docs, roomCollection, categoryAndRoomCollection)
+                res.send(hydrated)
+            } catch (err) {
+                console.error("Fetch bookings by IDs error:", err)
+                res.status(500).send({ message: "Failed to fetch reservations." })
+            }
+        })
+
+        // Protected Claim Guest Bookings endpoint (links guest bookings to newly logged-in account)
+        app.post("/bookings/claim-guest-bookings", verifyFBToken, async (req, res) => {
+            try {
+                const { bookingIds, userEmail, name } = req.body
+                const targetEmail = req.decodedEmail || userEmail
+                if (!Array.isArray(bookingIds) || bookingIds.length === 0 || !targetEmail) {
+                    return res.status(400).send({ message: "Valid booking IDs and user email are required." })
+                }
+                const cleanIds = bookingIds.map(id => String(id).trim()).filter(Boolean)
+                if (cleanIds.length === 0) {
+                    return res.send({ modifiedCount: 0 })
+                }
+
+                const now = new Date()
+                const result = await bookingCollection.updateMany(
+                    {
+                        bookingId: { $in: cleanIds },
+                        $or: [
+                            { userEmail: { $exists: false } },
+                            { userEmail: "" },
+                            { userEmail: null },
+                            { userEmail: { $regex: `^${targetEmail}$`, $options: "i" } }
+                        ]
+                    },
+                    {
+                        $set: {
+                            userEmail: targetEmail,
+                            "bookedBy.email": targetEmail,
+                            "bookedBy.name": name || "Guest",
+                            "bookedBy.role": "user",
+                            updatedAt: now
+                        }
+                    }
+                )
+                res.send(result)
+            } catch (err) {
+                console.error("Claim guest bookings error:", err)
+                res.status(500).send({ message: "Failed to claim reservations." })
+            }
+        })
+
         app.get("/bookings", verifyFBToken, async (req, res) => {
             const { email, status, reference, search, skip, limit } = req.query
             let query = {}
@@ -1138,6 +1199,277 @@ startRequestBookingAutoCancelJob(bookingCollection)
             res.send(result || null)
         })
 
+        function formatAuditDate(dateStr) {
+            if (!dateStr) return ""
+            try {
+                const parts = String(dateStr).trim().split('-')
+                if (parts.length === 3) {
+                    const [y, m, d] = parts
+                    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                    const monthIdx = parseInt(m, 10) - 1
+                    const monthName = months[monthIdx] || m
+                    const cleanDay = String(d).padStart(2, '0')
+                    return `${cleanDay} ${monthName} ${y}`
+                }
+                const d = new Date(dateStr)
+                if (!isNaN(d.getTime())) {
+                    const day = String(d.getDate()).padStart(2, '0')
+                    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                    return `${day} ${months[d.getMonth()]} ${d.getFullYear()}`
+                }
+                return String(dateStr)
+            } catch {
+                return String(dateStr)
+            }
+        }
+
+        function detectBookingChanges(oldDoc, updatePayload) {
+            if (!oldDoc || !updatePayload) return []
+            const changes = []
+
+            const normalizeStr = (val) => (val !== undefined && val !== null ? String(val).trim() : "")
+            const normalizeNum = (val) => (val !== undefined && val !== null && !isNaN(Number(val)) ? Number(val) : null)
+
+            // 1. Stay Dates
+            const oldRooms = Array.isArray(oldDoc.rooms) && oldDoc.rooms.length > 0 ? oldDoc.rooms : []
+            const newRooms = Array.isArray(updatePayload.rooms) ? updatePayload.rooms : null
+
+            const oldCheckIn = normalizeStr(oldRooms[0]?.checkIn || oldDoc.checkIn)
+            const oldCheckOut = normalizeStr(oldRooms[0]?.checkOut || oldDoc.checkOut)
+            const newCheckIn = normalizeStr(newRooms?.[0]?.checkIn || updatePayload.checkIn)
+            const newCheckOut = normalizeStr(newRooms?.[0]?.checkOut || updatePayload.checkOut)
+
+            if (newCheckIn && oldCheckIn && (oldCheckIn !== newCheckIn || oldCheckOut !== newCheckOut)) {
+                const oldFormatted = `${formatAuditDate(oldCheckIn)} to ${formatAuditDate(oldCheckOut)}`
+                const newFormatted = `${formatAuditDate(newCheckIn)} to ${formatAuditDate(newCheckOut)}`
+                changes.push({
+                    field: "stayDates",
+                    label: "Stay Dates",
+                    oldValue: oldFormatted,
+                    newValue: newFormatted,
+                    description: `Stay dates changed from ${formatAuditDate(oldCheckIn)} - ${formatAuditDate(oldCheckOut)} to ${formatAuditDate(newCheckIn)} - ${formatAuditDate(newCheckOut)}`
+                })
+            }
+
+            // 2. Room Assignments & Configurations
+            if (newRooms) {
+                if (oldRooms.length > 0 && oldRooms.length !== newRooms.length) {
+                    changes.push({
+                        field: "roomCount",
+                        label: "Room Count",
+                        oldValue: `${oldRooms.length} room(s)`,
+                        newValue: `${newRooms.length} room(s)`,
+                        description: `Room count modified from ${oldRooms.length} to ${newRooms.length}`
+                    })
+                }
+
+                const maxRooms = Math.max(oldRooms.length, newRooms.length)
+                for (let i = 0; i < maxRooms; i++) {
+                    const oldR = oldRooms[i] || {}
+                    const newR = newRooms[i] || {}
+
+                    const oldRoomNo = normalizeStr(oldR.roomNo) || "Unassigned"
+                    const newRoomNo = normalizeStr(newR.roomNo) || "Unassigned"
+
+                    if (newR.roomNo !== undefined && oldRoomNo !== newRoomNo) {
+                        changes.push({
+                            field: `roomNo_${i + 1}`,
+                            label: `Room ${i + 1} Assignment`,
+                            oldValue: oldRoomNo,
+                            newValue: newRoomNo,
+                            description: `Room ${i + 1} assignment changed from ${oldRoomNo} to ${newRoomNo}`
+                        })
+                    }
+
+                    const oldCategory = normalizeStr(oldR.categoryName || oldDoc.categoryName)
+                    const newCategory = normalizeStr(newR.categoryName)
+                    if (newCategory && oldCategory && oldCategory !== newCategory) {
+                        changes.push({
+                            field: `category_${i + 1}`,
+                            label: `Room ${i + 1} Category`,
+                            oldValue: oldCategory,
+                            newValue: newCategory,
+                            description: `Room ${i + 1} category changed from "${oldCategory}" to "${newCategory}"`
+                        })
+                    }
+
+                    const oldAdults = normalizeNum(oldR.adults)
+                    const newAdults = normalizeNum(newR.adults)
+                    if (newAdults !== null && oldAdults !== null && oldAdults !== newAdults) {
+                        changes.push({
+                            field: `adults_${i + 1}`,
+                            label: `Room ${i + 1} Adults`,
+                            oldValue: `${oldAdults} Adults`,
+                            newValue: `${newAdults} Adults`,
+                            description: `Room ${i + 1} adults updated from ${oldAdults} to ${newAdults}`
+                        })
+                    }
+
+                    const oldChildren = normalizeNum(oldR.children !== undefined ? oldR.children : oldR.babies)
+                    const newChildren = normalizeNum(newR.children !== undefined ? newR.children : newR.babies)
+                    if (newChildren !== null && oldChildren !== null && oldChildren !== newChildren) {
+                        changes.push({
+                            field: `children_${i + 1}`,
+                            label: `Room ${i + 1} Children`,
+                            oldValue: `${oldChildren} Children`,
+                            newValue: `${newChildren} Children`,
+                            description: `Room ${i + 1} children updated from ${oldChildren} to ${newChildren}`
+                        })
+                    }
+                }
+            }
+
+            // 3. Pricing & Financials
+            const oldTotal = normalizeNum(oldDoc.totalAmount) || 0
+            const newTotal = normalizeNum(updatePayload.totalAmount)
+            if (newTotal !== null && Math.abs(oldTotal - newTotal) > 0.01) {
+                changes.push({
+                    field: "totalAmount",
+                    label: "Total Amount",
+                    oldValue: `৳${oldTotal.toLocaleString()}`,
+                    newValue: `৳${newTotal.toLocaleString()}`,
+                    description: `Total amount changed from ৳${oldTotal.toLocaleString()} to ৳${newTotal.toLocaleString()}`
+                })
+            }
+
+            const oldDiscount = normalizeNum(oldDoc.discountAmount) || 0
+            const newDiscount = normalizeNum(updatePayload.discountAmount)
+            if (newDiscount !== null && Math.abs(oldDiscount - newDiscount) > 0.01) {
+                changes.push({
+                    field: "discountAmount",
+                    label: "Discount",
+                    oldValue: `৳${oldDiscount.toLocaleString()}`,
+                    newValue: `৳${newDiscount.toLocaleString()}`,
+                    description: `Discount changed from ৳${oldDiscount.toLocaleString()} to ৳${newDiscount.toLocaleString()}`
+                })
+            }
+
+            const oldPaid = normalizeNum(oldDoc.paidAmount !== undefined ? oldDoc.paidAmount : oldDoc.advanceAmount) || 0
+            const newPaid = normalizeNum(updatePayload.paidAmount)
+            if (newPaid !== null && Math.abs(oldPaid - newPaid) > 0.01) {
+                changes.push({
+                    field: "paidAmount",
+                    label: "Paid Amount",
+                    oldValue: `৳${oldPaid.toLocaleString()}`,
+                    newValue: `৳${newPaid.toLocaleString()}`,
+                    description: `Paid amount changed from ৳${oldPaid.toLocaleString()} to ৳${newPaid.toLocaleString()}`
+                })
+            }
+
+            const oldExtraCost = normalizeNum(oldDoc.extraServiceCost) || 0
+            const newExtraCost = normalizeNum(updatePayload.extraServiceCost)
+            if (newExtraCost !== null && Math.abs(oldExtraCost - newExtraCost) > 0.01) {
+                changes.push({
+                    field: "extraServiceCost",
+                    label: "Extra Service Cost",
+                    oldValue: `৳${oldExtraCost.toLocaleString()}`,
+                    newValue: `৳${newExtraCost.toLocaleString()}`,
+                    description: `Extra service cost changed from ৳${oldExtraCost.toLocaleString()} to ৳${newExtraCost.toLocaleString()}`
+                })
+            }
+
+            const oldExtraService = normalizeStr(oldDoc.extraService)
+            const newExtraService = updatePayload.extraService !== undefined ? normalizeStr(updatePayload.extraService) : null
+            if (newExtraService !== null && oldExtraService !== newExtraService) {
+                changes.push({
+                    field: "extraService",
+                    label: "Extra Services",
+                    oldValue: oldExtraService || "None",
+                    newValue: newExtraService || "None",
+                    description: `Extra services updated to "${newExtraService || "None"}"`
+                })
+            }
+
+            // 4. Guest Details
+            const oldName = normalizeStr(oldDoc.name)
+            const newName = updatePayload.name !== undefined ? normalizeStr(updatePayload.name) : null
+            if (newName !== null && oldName !== newName) {
+                changes.push({
+                    field: "name",
+                    label: "Guest Name",
+                    oldValue: oldName || "None",
+                    newValue: newName || "None",
+                    description: `Guest name updated from "${oldName}" to "${newName}"`
+                })
+            }
+
+            const oldMobile = normalizeStr(oldDoc.mobile)
+            const newMobile = updatePayload.mobile !== undefined ? normalizeStr(updatePayload.mobile) : null
+            if (newMobile !== null && oldMobile !== newMobile) {
+                changes.push({
+                    field: "mobile",
+                    label: "Guest Mobile",
+                    oldValue: oldMobile || "None",
+                    newValue: newMobile || "None",
+                    description: `Guest mobile changed from "${oldMobile}" to "${newMobile}"`
+                })
+            }
+
+            const oldAddress = normalizeStr(oldDoc.address)
+            const newAddress = updatePayload.address !== undefined ? normalizeStr(updatePayload.address) : null
+            if (newAddress !== null && oldAddress !== newAddress) {
+                changes.push({
+                    field: "address",
+                    label: "Guest Address",
+                    oldValue: oldAddress || "None",
+                    newValue: newAddress || "None",
+                    description: `Guest address updated`
+                })
+            }
+
+            const oldEmail = normalizeStr(oldDoc.userEmail || oldDoc.email)
+            const newEmail = updatePayload.userEmail !== undefined ? normalizeStr(updatePayload.userEmail) : null
+            if (newEmail !== null && oldEmail !== newEmail) {
+                changes.push({
+                    field: "userEmail",
+                    label: "Guest Email",
+                    oldValue: oldEmail || "None",
+                    newValue: newEmail || "None",
+                    description: `Guest email updated from "${oldEmail}" to "${newEmail}"`
+                })
+            }
+
+            // 5. Reference & Notes
+            const oldRef = normalizeStr(oldDoc.reference)
+            const newRef = updatePayload.reference !== undefined ? normalizeStr(updatePayload.reference) : null
+            if (newRef !== null && oldRef !== newRef) {
+                changes.push({
+                    field: "reference",
+                    label: "Staff Reference",
+                    oldValue: oldRef || "None",
+                    newValue: newRef || "None",
+                    description: `Staff reference changed to "${newRef || "None"}"`
+                })
+            }
+
+            const oldNotes = normalizeStr(oldDoc.notes)
+            const newNotes = updatePayload.notes !== undefined ? normalizeStr(updatePayload.notes) : null
+            if (newNotes !== null && oldNotes !== newNotes) {
+                changes.push({
+                    field: "notes",
+                    label: "Special Notes",
+                    oldValue: oldNotes || "None",
+                    newValue: newNotes || "None",
+                    description: `Special notes updated`
+                })
+            }
+
+            // 6. Status
+            const oldStatus = normalizeStr(oldDoc.status)
+            const newStatus = normalizeStr(updatePayload.status)
+            if (newStatus && oldStatus && oldStatus !== newStatus) {
+                changes.push({
+                    field: "status",
+                    label: "Status Transition",
+                    oldValue: oldStatus,
+                    newValue: newStatus,
+                    description: `Status changed from "${oldStatus}" to "${newStatus}"`
+                })
+            }
+
+            return changes
+        }
+
         app.patch("/booking/:id", verifyFBToken, async (req, res) => {
             const { id } = req.params
             const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
@@ -1161,6 +1493,18 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 changedBy
             } = req.body
 
+            const currentDoc = await bookingCollection.findOne(query)
+            if (!currentDoc) {
+                return res.status(404).send({ message: "Reservation not found." })
+            }
+
+            // Resolve actor info for audit trail
+            const actorInfo = changedBy || {
+                email: req.decodedEmail || "",
+                name: req.body.changedByName || "Staff / Admin",
+                role: requestedByRole || "admin"
+            }
+
             const updateData = { updatedAt: now }
             if (name !== undefined) updateData.name = name
             if (mobile !== undefined) updateData.mobile = mobile
@@ -1180,10 +1524,23 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
             const update = { $set: updateData }
 
+            // Detect and record fine-grained field changes into editHistory
+            const detectedChanges = detectBookingChanges(currentDoc, { ...req.body, ...updateData })
+            if (detectedChanges.length > 0) {
+                const editLogEntry = {
+                    timestamp: now,
+                    changedBy: actorInfo,
+                    summary: detectedChanges.map(c => c.description),
+                    changes: detectedChanges
+                }
+                if (!update.$push) update.$push = {}
+                update.$push.editHistory = editLogEntry
+            }
+
             // Validate rooms against Out of Order maintenance and conflicts
             const targetRoomsForValidation = Array.isArray(rooms) && rooms.length > 0
                 ? rooms
-                : (status && status !== BOOKING_STATUS.CANCEL ? ((await bookingCollection.findOne(query))?.rooms || []) : [])
+                : (status && status !== BOOKING_STATUS.CANCEL ? (currentDoc.rooms || []) : [])
 
             if (targetRoomsForValidation.length > 0 && status !== BOOKING_STATUS.CANCEL) {
                 for (const r of targetRoomsForValidation) {
@@ -1244,7 +1601,7 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 if (status !== BOOKING_STATUS.REQUEST_BOOKING && status !== BOOKING_STATUS.CANCEL) {
                     const targetRooms = Array.isArray(rooms) && rooms.length > 0
                         ? rooms
-                        : (await bookingCollection.findOne(query))?.rooms || []
+                        : (currentDoc.rooms || [])
                     const missingRoom = targetRooms.find(r => !r.roomNo || !String(r.roomNo).trim())
                     if (missingRoom) {
                         return res.status(400).send({
@@ -1266,7 +1623,6 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 ].includes(status)
 
                 if (isConfirmedStatus) {
-                    const currentDoc = await bookingCollection.findOne(query)
                     const targetRooms = Array.isArray(rooms) && rooms.length > 0 ? rooms : (currentDoc?.rooms || [])
                     
                     const effectiveName = updateData.name || currentDoc?.name
@@ -1307,28 +1663,18 @@ startRequestBookingAutoCancelJob(bookingCollection)
 
                 // Check-out requires full payment
                 if (status === BOOKING_STATUS.CHECKED_OUT || status === "checked_out") {
-                    const currentDoc = await bookingCollection.findOne(query)
-                    if (currentDoc) {
-                        const effectiveTotal = getBookingTotal({ ...currentDoc, ...updateData })
-                        const effectivePaid = updateData.paidAmount !== undefined ? updateData.paidAmount : getBookingPaidAmount(currentDoc)
-                        const remainingDue = Math.max(0, effectiveTotal - effectivePaid)
-                        if (remainingDue > 0.01) {
-                            return res.status(400).send({
-                                message: `Cannot check out: Outstanding balance of ৳${remainingDue.toLocaleString()} is remaining. Please complete full payment before checking out.`
-                            })
-                        }
+                    const effectiveTotal = getBookingTotal({ ...currentDoc, ...updateData })
+                    const effectivePaid = updateData.paidAmount !== undefined ? updateData.paidAmount : getBookingPaidAmount(currentDoc)
+                    const remainingDue = Math.max(0, effectiveTotal - effectivePaid)
+                    if (remainingDue > 0.01) {
+                        return res.status(400).send({
+                            message: `Cannot check out: Outstanding balance of ৳${remainingDue.toLocaleString()} is remaining. Please complete full payment before checking out.`
+                        })
                     }
                 }
 
                 updateData.status = status
                 updateData.statusUpdatedAt = now
-
-                // Resolve who made the change
-                const actorInfo = changedBy || {
-                    email: req.decodedEmail || "",
-                    name: req.body.changedByName || "Staff / Admin",
-                    role: requestedByRole || "admin"
-                }
 
                 const historyItem = { 
                     status, 
@@ -1337,7 +1683,8 @@ startRequestBookingAutoCancelJob(bookingCollection)
                 }
                 if (cancelReason) historyItem.note = cancelReason
 
-                update.$push = { statusHistory: historyItem }
+                if (!update.$push) update.$push = {}
+                update.$push.statusHistory = historyItem
 
                 if (status === BOOKING_STATUS.REQUEST_BOOKING) {
                     const expireHours = getRequestBookingExpireHours(requestedByRole)
@@ -1352,67 +1699,56 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     updateData.cancelReason = cancelReason || "No reason provided"
                     updateData.cancelledBy = actorInfo
 
-                    const currentDoc = await bookingCollection.findOne(query)
-                    if (currentDoc) {
-                        const prevPaid = Number(currentDoc.paidAmount !== undefined ? currentDoc.paidAmount : (currentDoc.advanceAmount || 0))
-                        const refundAmt = Number(req.body.refundAmount || 0)
+                    const prevPaid = Number(currentDoc.paidAmount !== undefined ? currentDoc.paidAmount : (currentDoc.advanceAmount || 0))
+                    const refundAmt = Number(req.body.refundAmount || 0)
 
-                        if (refundAmt > 0) {
-                            if (refundAmt > prevPaid) {
-                                return res.status(400).send({
-                                    message: `Refund amount (৳${refundAmt.toLocaleString()}) cannot exceed total paid amount (৳${prevPaid.toLocaleString()}).`
-                                })
-                            }
-                            updateData.refundAmount = refundAmt
-                            const newPaid = Math.max(0, prevPaid - refundAmt)
-                            updateData.paidAmount = newPaid
-                            updateData.dueAmount = Math.max(0, getBookingTotal(currentDoc) - newPaid)
-
-                            const refundEntry = {
-                                amount: -refundAmt,
-                                refundAmount: refundAmt,
-                                paymentMethod: req.body.refundPaymentMethod || req.body.paymentMethod || "Refund",
-                                reference: updateData.reference || currentDoc.reference || "",
-                                transactionId: req.body.refundTransactionId || updateData.transactionId || "",
-                                note: `Refund of ৳${refundAmt.toLocaleString()} issued upon cancellation. Reason: ${cancelReason || "Cancellation"}`,
-                                date: now,
-                                collectedBy: actorInfo
-                            }
-                            if (!update.$push) update.$push = {}
-                            update.$push.paymentHistory = refundEntry
-                            historyItem.note = `${cancelReason || "Reservation cancelled"} (Refunded: ৳${refundAmt.toLocaleString()})`
+                    if (refundAmt > 0) {
+                        if (refundAmt > prevPaid) {
+                            return res.status(400).send({
+                                message: `Refund amount (৳${refundAmt.toLocaleString()}) cannot exceed total paid amount (৳${prevPaid.toLocaleString()}).`
+                            })
                         }
+                        updateData.refundAmount = refundAmt
+                        const newPaid = Math.max(0, prevPaid - refundAmt)
+                        updateData.paidAmount = newPaid
+                        updateData.dueAmount = Math.max(0, getBookingTotal(currentDoc) - newPaid)
+
+                        const refundEntry = {
+                            amount: -refundAmt,
+                            refundAmount: refundAmt,
+                            paymentMethod: req.body.refundPaymentMethod || req.body.paymentMethod || "Refund",
+                            reference: updateData.reference || currentDoc.reference || "",
+                            transactionId: req.body.refundTransactionId || updateData.transactionId || "",
+                            note: `Refund of ৳${refundAmt.toLocaleString()} issued upon cancellation. Reason: ${cancelReason || "Cancellation"}`,
+                            date: now,
+                            collectedBy: actorInfo
+                        }
+                        if (!update.$push) update.$push = {}
+                        update.$push.paymentHistory = refundEntry
+                        historyItem.note = `${cancelReason || "Reservation cancelled"} (Refunded: ৳${refundAmt.toLocaleString()})`
                     }
                 }
             }
 
             // Record payment entry in paymentHistory if paidAmount was recorded/increased
             if (updateData.paidAmount !== undefined) {
-                const currentDoc = await bookingCollection.findOne(query)
-                if (currentDoc) {
-                    const prevPaid = Number(currentDoc.paidAmount !== undefined ? currentDoc.paidAmount : (currentDoc.advanceAmount || 0))
-                    const newPaid = Number(updateData.paidAmount)
-                    const diff = newPaid - prevPaid
-                    if (diff > 0) {
-                        const actorInfo = changedBy || {
-                            email: req.decodedEmail || "",
-                            name: req.body.changedByName || "Staff / Admin",
-                            role: requestedByRole || "admin"
-                        }
-                        const method = req.body.paymentMethod || updateData.paymentMethod || currentDoc.paymentMethod || "Cash"
-                        const trx = updateData.transactionId || (method === "Cash" ? "Cash / Direct" : "")
-                        const payEntry = {
-                            amount: diff,
-                            paymentMethod: method,
-                            reference: updateData.reference || currentDoc.reference || "",
-                            transactionId: trx,
-                            note: updateData.notes || `Payment of ৳${diff.toLocaleString()} recorded`,
-                            date: now,
-                            collectedBy: actorInfo
-                        }
-                        if (!update.$push) update.$push = {}
-                        update.$push.paymentHistory = payEntry
+                const prevPaid = Number(currentDoc.paidAmount !== undefined ? currentDoc.paidAmount : (currentDoc.advanceAmount || 0))
+                const newPaid = Number(updateData.paidAmount)
+                const diff = newPaid - prevPaid
+                if (diff > 0) {
+                    const method = req.body.paymentMethod || updateData.paymentMethod || currentDoc.paymentMethod || "Cash"
+                    const trx = updateData.transactionId || (method === "Cash" ? "Cash / Direct" : "")
+                    const payEntry = {
+                        amount: diff,
+                        paymentMethod: method,
+                        reference: updateData.reference || currentDoc.reference || "",
+                        transactionId: trx,
+                        note: updateData.notes || `Payment of ৳${diff.toLocaleString()} recorded`,
+                        date: now,
+                        collectedBy: actorInfo
                     }
+                    if (!update.$push) update.$push = {}
+                    update.$push.paymentHistory = payEntry
                 }
             }
 
@@ -1607,13 +1943,30 @@ startRequestBookingAutoCancelJob(bookingCollection)
                     note: `Collected due payment of ৳${payAmount.toLocaleString()} via ${paymentMethod || "Cash"}${transactionId ? ` (Trx: ${transactionId})` : ""}`
                 }
 
+                const prevPaid = Number(booking.paidAmount !== undefined ? booking.paidAmount : (booking.advanceAmount || 0))
+                const editAuditEntry = {
+                    timestamp: now,
+                    changedBy: actorInfo,
+                    summary: [`Collected due payment of ৳${payAmount.toLocaleString()} via ${paymentMethod || "Cash"}`],
+                    changes: [
+                        {
+                            field: "paidAmount",
+                            label: "Payment Collected",
+                            oldValue: `৳${prevPaid.toLocaleString()}`,
+                            newValue: `৳${(prevPaid + payAmount).toLocaleString()}`,
+                            description: `Collected due payment of ৳${payAmount.toLocaleString()} via ${paymentMethod || "Cash"}${transactionId ? ` (Trx: ${transactionId})` : ""}`
+                        }
+                    ]
+                }
+
                 const result = await bookingCollection.findOneAndUpdate(
                     query,
                     {
                         $inc: { paidAmount: payAmount },
                         $push: {
                             paymentHistory: paymentEntry,
-                            statusHistory: statusAuditEntry
+                            statusHistory: statusAuditEntry,
+                            editHistory: editAuditEntry
                         },
                         $set: { updatedAt: now }
                     },
