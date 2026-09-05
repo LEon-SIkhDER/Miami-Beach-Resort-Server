@@ -8,7 +8,13 @@ const cron = require("node-cron")
 require('dotenv').config()
 const dns = require("dns")
 
-dns.setServers(["8.8.8.8", "1.1.1.1"])
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    try {
+        dns.setServers(["8.8.8.8", "1.1.1.1"])
+    } catch (e) {
+        console.log("DNS setServers warning:", e.message)
+    }
+}
 
 
 app.use(cors())
@@ -42,13 +48,36 @@ cloudinary.config({
 // mongodb
 const uri = `mongodb+srv://${process.env.DB_USERNAME}:${process.env.DB_PASSWORD}@cluster0.7hhwads.mongodb.net/?appName=Cluster0`
 
-const client = new MongoClient(uri, {
-    serverApi: {
-        version: ServerApiVersion.v1,
-        strict: true,
-        deprecationErrors: true,
+let client = null
+let db = null
+
+function getDatabase() {
+    if (!client || (client.topology && (client.topology.isDestroyed?.() || client.topology.isClosed?.()))) {
+        client = new MongoClient(uri, {
+            serverApi: {
+                version: ServerApiVersion.v1,
+                strict: true,
+                deprecationErrors: true,
+            }
+        })
+        db = client.db("miami_beach_resort_db")
     }
-})
+    return db
+}
+
+const getCollection = (name) => {
+    return new Proxy({}, {
+        get(target, prop) {
+            const database = getDatabase()
+            const col = database.collection(name)
+            const value = col[prop]
+            if (typeof value === 'function') {
+                return value.bind(col)
+            }
+            return value
+        }
+    })
+}
 
 const generateBookingId = () => {
     const today = new Date()
@@ -359,17 +388,18 @@ const startRequestBookingAutoCancelJob = (bookingCollection) => {
     })
 }
 
-const db = client.db("miami_beach_resort_db")
 // collections
-const userCollection = db.collection("users")
-const roomCollection = db.collection("rooms")
-const bookingCollection = db.collection("bookings")
-const categoryAndRoomCollection = db.collection("categoryandroom")
-const outOfOrderCollection = db.collection("out_of_order")
+const userCollection = getCollection("users")
+const roomCollection = getCollection("rooms")
+const bookingCollection = getCollection("bookings")
+const categoryAndRoomCollection = getCollection("categoryandroom")
+const outOfOrderCollection = getCollection("out_of_order")
 
 // Initialize indexes and cron in background without blocking startup / route registration
-ensureBookingIdIndex(bookingCollection).catch(err => console.log("Index init error:", err.message))
-startRequestBookingAutoCancelJob(bookingCollection)
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    ensureBookingIdIndex(bookingCollection).catch(err => console.log("Index init error:", err.message))
+    startRequestBookingAutoCancelJob(bookingCollection)
+}
 
 // Simplified fast auth pass-through (no JWT bottlenecks)
         const verifyFBToken = (req, res, next) => {
