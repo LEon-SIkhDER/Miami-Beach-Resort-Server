@@ -184,7 +184,7 @@ const normalizeBookingRooms = (data = {}) => {
         roomNo: room.roomNo || "",
         checkIn: room.checkIn,
         checkOut: room.checkOut,
-        adults: Number(room.adults || 1),
+        adults: Number(room.adults || 0),
         babies: Number(room.babies || 0),
         pricePerNight: Number(room.pricePerNight || 0)
     }))
@@ -1017,6 +1017,12 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     }
                 }
 
+                const postPaid = Number(data.paidAmount || 0)
+                const postTotal = Number(data.totalAmount || 0)
+                if (!isNaN(postPaid) && !isNaN(postTotal) && postTotal > 0 && postPaid > postTotal + 0.01) {
+                    return res.status(400).send({ message: `Paid amount (${postPaid}) cannot exceed the booking total (${postTotal}).` })
+                }
+
                 const expireHours = getRequestBookingExpireHours(requestedByRole)
                 const requestExpiresAt = status === BOOKING_STATUS.REQUEST_BOOKING ? new Date(today.getTime() + expireHours * 60 * 60 * 1000) : undefined
 
@@ -1700,6 +1706,15 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                         return res.status(400).send({
                             message: `Cannot check out: Outstanding balance of ৳${remainingDue.toLocaleString()} is remaining. Please complete full payment before checking out.`
                         })
+                    }
+                }
+
+                // Universal guard: paid can never exceed total
+                if (updateData.paidAmount !== undefined) {
+                    const patchPaid = Number(updateData.paidAmount)
+                    const patchTotal = updateData.totalAmount !== undefined ? Number(updateData.totalAmount) : Number(currentDoc.totalAmount || 0)
+                    if (!isNaN(patchPaid) && !isNaN(patchTotal) && patchTotal > 0 && patchPaid > patchTotal + 0.01) {
+                        return res.status(400).send({ message: `Paid amount (${patchPaid}) cannot exceed the booking total (${patchTotal}).` })
                     }
                 }
 
