@@ -80,15 +80,12 @@ const getCollection = (name) => {
 }
 
 const generateBookingId = () => {
-    const today = new Date()
-    const date = today.toISOString().split("T")[0].replaceAll("-", "")
-    const random = Math.random().toString(36).slice(2, 8).toUpperCase()
-    return `BK-${date}-${random}`
+    const random = Math.random().toString(36).slice(2, 8).toUpperCase().padEnd(6, "0")
+    return `BK-${random}`
 }
 
 const BOOKING_STATUS = {
     REQUEST_BOOKING: "request_booking",
-    PAYMENT_WAITING: "payment_waiting",
     BOOKING_CONFIRMED: "booking_confirmed",
     CHECKED_IN: "checked_id",
     CHECKED_OUT: "checked_out",
@@ -97,7 +94,6 @@ const BOOKING_STATUS = {
 
 const ACTIVE_BOOKING_STATUSES = [
     BOOKING_STATUS.REQUEST_BOOKING,
-    BOOKING_STATUS.PAYMENT_WAITING,
     BOOKING_STATUS.BOOKING_CONFIRMED,
     BOOKING_STATUS.CHECKED_IN,
     "pending",
@@ -572,7 +568,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     stats: {
                         totalBookings: userBookings.length,
                         confirmedBookings: confirmedBookings.length,
-                        pendingBookings: userBookings.filter(b => [BOOKING_STATUS.REQUEST_BOOKING, BOOKING_STATUS.PAYMENT_WAITING, "pending"].includes(b.status)).length,
+                        pendingBookings: userBookings.filter(b => [BOOKING_STATUS.REQUEST_BOOKING, "pending"].includes(b.status)).length,
                         cancelledBookings: userBookings.filter(b => [BOOKING_STATUS.CANCEL, "cancelled"].includes(b.status)).length,
                         totalSales,
                         totalPaid,
@@ -671,7 +667,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     metrics: {
                         totalBookings: userBookings.length,
                         confirmedBookings: confirmedBookings.length,
-                        pendingBookings: userBookings.filter(b => [BOOKING_STATUS.REQUEST_BOOKING, BOOKING_STATUS.PAYMENT_WAITING, "pending"].includes(b.status)).length,
+                        pendingBookings: userBookings.filter(b => [BOOKING_STATUS.REQUEST_BOOKING, "pending"].includes(b.status)).length,
                         cancelledBookings: userBookings.filter(b => [BOOKING_STATUS.CANCEL, "cancelled"].includes(b.status)).length,
                         totalSales,
                         totalPaid,
@@ -2369,7 +2365,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             const result = {
                 totalBookings: Object.values(statusMap).reduce((total, count) => total + count, 0),
                 confirmedCount: (statusMap.booking_confirmed || 0) + (statusMap.checked_id || 0) + (statusMap.checked_out || 0) + (statusMap.confirmed || 0),
-                pendingCount: (statusMap.request_booking || 0) + (statusMap.payment_waiting || 0) + (statusMap.pending || 0),
+                pendingCount: (statusMap.request_booking || 0) + (statusMap.pending || 0),
                 cancelledCount: (statusMap.cancel || 0) + (statusMap.cancelled || 0),
                 totalRevenue,
                 monthlyRevenue,
