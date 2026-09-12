@@ -1059,6 +1059,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     createdBy: data.createdBy || actorInfo,
                     transactionId: data.transactionId || "",
                     notes: data.notes || "",
+                    guestType: data.guestType || ((requestedByRole === "user" || !requestedByRole || String(resolvedReference || "").toLowerCase().includes("website")) ? "WEB" : "Walk-In"),
                     createdAt: today,
                     requestedByRole,
                     status,
@@ -2144,8 +2145,72 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
         // CATEGORY & ROOM ..............................................
         app.get("/categoryandroom", async (req, res) => {
-            const result = await categoryAndRoomCollection.find().toArray()
-            res.send(result)
+            try {
+                const { search, category, sort } = req.query
+                const match = {}
+
+                if (category && typeof category === 'string' && category.trim()) {
+                    match.name = category.trim()
+                }
+
+                if (search && typeof search === 'string' && search.trim()) {
+                    const cleanSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    const sRegex = { $regex: cleanSearch, $options: "i" }
+                    const searchOr = [
+                        { name: sRegex },
+                        { amenities: sRegex },
+                        { description: sRegex }
+                    ]
+                    if (match.name) {
+                        match.$and = [
+                            { name: match.name },
+                            { $or: searchOr }
+                        ]
+                        delete match.name
+                    } else {
+                        match.$or = searchOr
+                    }
+                }
+
+                const pipeline = []
+                if (Object.keys(match).length > 0) {
+                    pipeline.push({ $match: match })
+                }
+
+                if (sort === "price-asc" || sort === "price-desc") {
+                    pipeline.push({
+                        $addFields: {
+                            numericPrice: {
+                                $convert: {
+                                    input: "$price",
+                                    to: "double",
+                                    onError: 0,
+                                    onNull: 0
+                                }
+                            }
+                        }
+                    })
+                    pipeline.push({
+                        $sort: { numericPrice: sort === "price-asc" ? 1 : -1 }
+                    })
+                } else if (sort === "name-asc") {
+                    pipeline.push({
+                        $sort: { name: 1 }
+                    })
+                }
+
+                let result
+                if (pipeline.length > 0) {
+                    result = await categoryAndRoomCollection.aggregate(pipeline).toArray()
+                } else {
+                    result = await categoryAndRoomCollection.find().toArray()
+                }
+
+                res.send(result)
+            } catch (err) {
+                console.error("Get categoryandroom error:", err)
+                res.status(500).send({ message: "Failed to fetch categories" })
+            }
         })
 
         app.get("/categoryandroom/:id", async (req, res) => {
@@ -2472,6 +2537,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             extraService: booking.extraService || "",
                             extraServiceCost: Number(booking.extraServiceCost || 0),
                             requestedByRole: booking.requestedByRole || booking.changedBy?.role || "",
+                            guestType: booking.guestType || ((booking.requestedByRole === "user" || !booking.requestedByRole || String(booking.reference || "").toLowerCase().includes("website")) ? "WEB" : "Walk-In"),
                             bookedBy: booking.bookedBy || booking.createdBy || booking.changedBy || null,
                             status: booking.status,
                             createdAt: booking.createdAt,
