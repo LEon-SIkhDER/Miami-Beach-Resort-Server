@@ -1126,6 +1126,37 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     role: requestedByRole
                 }
 
+                let normalizedExtraServices = null
+                let resolvedExtraServiceName = ""
+                let resolvedExtraServiceCost = 0
+
+                if (Array.isArray(data.extraServices)) {
+                    normalizedExtraServices = data.extraServices.map(s => ({
+                        serviceId: s.serviceId || s._id || "",
+                        name: s.name || "",
+                        billingType: s.billingType || "One-time",
+                        unitPrice: Number(s.unitPrice !== undefined ? s.unitPrice : (s.price || 0)),
+                        quantity: Math.max(1, Number(s.quantity || 1)),
+                        totalCost: Number(s.totalCost !== undefined ? s.totalCost : (Number(s.unitPrice || s.price || 0) * Math.max(1, Number(s.quantity || 1))))
+                    }))
+                    resolvedExtraServiceName = normalizedExtraServices.map(s => s.name).filter(Boolean).join(", ")
+                    resolvedExtraServiceCost = normalizedExtraServices.reduce((sum, s) => sum + Number(s.totalCost || 0), 0)
+                } else if (data.extraServices && typeof data.extraServices === 'object') {
+                    normalizedExtraServices = [data.extraServices]
+                    resolvedExtraServiceName = data.extraServices.name || data.extraService || ""
+                    resolvedExtraServiceCost = Number(data.extraServices.totalCost !== undefined ? data.extraServices.totalCost : (data.extraServiceCost || 0))
+                } else if (data.extraService) {
+                    resolvedExtraServiceName = data.extraService
+                    resolvedExtraServiceCost = Number(data.extraServiceCost || 0)
+                    normalizedExtraServices = [{
+                        name: data.extraService,
+                        totalCost: resolvedExtraServiceCost,
+                        quantity: Number(data.extraServiceQuantity || 1),
+                        billingType: data.extraServiceBillingType || "Per Night",
+                        unitPrice: Number(data.extraServiceUnitPrice || resolvedExtraServiceCost)
+                    }]
+                }
+
                 const bookingData = {
                     name: data.name,
                     mobile: data.mobile,
@@ -1146,8 +1177,9 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                         date: today,
                         collectedBy: actorInfo
                     }] : [],
-                    extraService: data.extraService || "",
-                    extraServiceCost: Number(data.extraServiceCost || 0),
+                    extraService: resolvedExtraServiceName,
+                    extraServiceCost: resolvedExtraServiceCost,
+                    extraServices: normalizedExtraServices,
                     reference: resolvedReference,
                     bookedBy: data.bookedBy || actorInfo,
                     createdBy: data.createdBy || actorInfo,
@@ -1648,8 +1680,32 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             if (reference !== undefined) updateData.reference = reference
             if (transactionId !== undefined) updateData.transactionId = transactionId
             if (notes !== undefined) updateData.notes = notes
-            if (req.body.extraService !== undefined) updateData.extraService = req.body.extraService
-            if (req.body.extraServiceCost !== undefined) updateData.extraServiceCost = Number(req.body.extraServiceCost || 0)
+            if (req.body.extraServices !== undefined) {
+                if (Array.isArray(req.body.extraServices)) {
+                    const normalized = req.body.extraServices.map(s => ({
+                        serviceId: s.serviceId || s._id || "",
+                        name: s.name || "",
+                        billingType: s.billingType || "One-time",
+                        unitPrice: Number(s.unitPrice !== undefined ? s.unitPrice : (s.price || 0)),
+                        quantity: Math.max(1, Number(s.quantity || 1)),
+                        totalCost: Number(s.totalCost !== undefined ? s.totalCost : (Number(s.unitPrice || s.price || 0) * Math.max(1, Number(s.quantity || 1))))
+                    }))
+                    updateData.extraServices = normalized
+                    updateData.extraService = normalized.map(s => s.name).filter(Boolean).join(", ")
+                    updateData.extraServiceCost = normalized.reduce((sum, s) => sum + Number(s.totalCost || 0), 0)
+                } else if (req.body.extraServices && typeof req.body.extraServices === 'object') {
+                    updateData.extraServices = [req.body.extraServices]
+                    updateData.extraService = req.body.extraServices.name || req.body.extraService || ""
+                    updateData.extraServiceCost = Number(req.body.extraServices.totalCost !== undefined ? req.body.extraServices.totalCost : (req.body.extraServiceCost || 0))
+                } else {
+                    updateData.extraServices = []
+                    updateData.extraService = ""
+                    updateData.extraServiceCost = 0
+                }
+            } else {
+                if (req.body.extraService !== undefined) updateData.extraService = req.body.extraService
+                if (req.body.extraServiceCost !== undefined) updateData.extraServiceCost = Number(req.body.extraServiceCost || 0)
+            }
             if (req.body.paymentMethod !== undefined) updateData.paymentMethod = req.body.paymentMethod
 
             const update = { $set: updateData }
@@ -2461,7 +2517,6 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             try {
                 const service = {
                     name: req.body.name,
-                    category: req.body.category || "General",
                     price: Number(req.body.price || 0),
                     currency: req.body.currency || "৳",
                     billingType: req.body.billingType || "Per Night",
@@ -2470,6 +2525,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     popular: !!req.body.popular,
                     createdAt: new Date()
                 }
+                if (req.body.category) service.category = req.body.category
                 const result = await extraServicesCollection.insertOne(service)
                 res.send({ acknowledged: true, insertedId: result.insertedId, ...service })
             } catch (error) {
@@ -2480,7 +2536,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         app.patch("/extra-services/:id", async (req, res) => {
             try {
                 const { id } = req.params
-                const query = { _id: toObjectId(id) || id }
+                const query = toObjectId(id) ? { $or: [{ _id: toObjectId(id) }, { _id: id }] } : { _id: id }
                 const update = { $set: {} }
                 if (req.body.active !== undefined) update.$set.active = req.body.active
                 if (req.body.name !== undefined) update.$set.name = req.body.name
@@ -2498,7 +2554,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         app.delete("/extra-services/:id", async (req, res) => {
             try {
                 const { id } = req.params
-                const query = { _id: toObjectId(id) || id }
+                const query = toObjectId(id) ? { $or: [{ _id: toObjectId(id) }, { _id: id }] } : { _id: id }
                 const result = await extraServicesCollection.deleteOne(query)
                 res.send(result)
             } catch (error) {
