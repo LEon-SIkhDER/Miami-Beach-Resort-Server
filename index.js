@@ -136,7 +136,10 @@ const getNightCount = (checkIn, checkOut) => {
 
 const getBookingRooms = (booking = {}) => {
     if (Array.isArray(booking.rooms) && booking.rooms.length) {
-        return booking.rooms
+        return booking.rooms.map(r => ({
+            ...r,
+            nights: Number(r.nights) || getNightCount(r.checkIn || booking.checkIn, r.checkOut || booking.checkOut) || 1
+        }))
     }
 
     if (!booking.roomId && !booking.checkIn && !booking.checkOut) {
@@ -151,6 +154,7 @@ const getBookingRooms = (booking = {}) => {
         adults: Number(booking.adults || 1),
         babies: Number(booking.babies || 0),
         pricePerNight: Number(booking.pricePerNight || booking.price || 0),
+        nights: getNightCount(booking.checkIn, booking.checkOut) || 1,
         room: {
             name: booking.roomName,
             category: booking.roomCategory
@@ -170,20 +174,27 @@ const normalizeBookingRooms = (data = {}) => {
             checkOut: data.checkOut,
             adults: data.adults,
             babies: data.babies,
-            pricePerNight: data.pricePerNight || data.price
+            pricePerNight: data.pricePerNight || data.price,
+            nights: data.nights
         }]
 
-    return rawRooms.map(room => ({
-        roomId: String(room.roomId || room.categoryId || ""),
-        categoryId: room.categoryId ? String(room.categoryId) : (room.roomId ? String(room.roomId) : ""),
-        categoryName: room.categoryName || "",
-        roomNo: room.roomNo || "",
-        checkIn: room.checkIn,
-        checkOut: room.checkOut,
-        adults: Number(room.adults || 0),
-        babies: Number(room.babies || 0),
-        pricePerNight: Number(room.pricePerNight || 0)
-    }))
+    return rawRooms.map(room => {
+        const checkIn = room.checkIn || data.checkIn
+        const checkOut = room.checkOut || data.checkOut
+        const nights = Number(room.nights) || getNightCount(checkIn, checkOut) || 1
+        return {
+            roomId: String(room.roomId || room.categoryId || ""),
+            categoryId: room.categoryId ? String(room.categoryId) : (room.roomId ? String(room.roomId) : ""),
+            categoryName: String(room.categoryName || "").replace(/[\u200B-\u200D\uFEFF]/g, '').trim(),
+            roomNo: room.roomNo || "",
+            checkIn: checkIn,
+            checkOut: checkOut,
+            adults: Number(room.adults || 0),
+            babies: Number(room.babies || 0),
+            pricePerNight: Number(room.pricePerNight || 0),
+            nights: nights
+        }
+    })
 }
 
 const getRoomTotal = (room = {}) => {
@@ -286,9 +297,11 @@ const hydrateBookingsWithRooms = async (bookings = [], roomCollection, categoryA
         const rooms = getBookingRooms(booking).map(room => {
             const lookupId = String(room.categoryId || room.roomId || "")
             const matched = docMap.get(lookupId) || room.room || null
+            const rawCat = room.categoryName || matched?.name || matched?.category || "Category Room"
+            const cleanCat = String(rawCat).replace(/[\u200B-\u200D\uFEFF]/g, '').trim()
             return {
                 ...room,
-                categoryName: room.categoryName || matched?.name || matched?.category || "Category Room",
+                categoryName: cleanCat,
                 room: matched || room.room || null
             }
         })
@@ -390,11 +403,92 @@ const roomCollection = getCollection("rooms")
 const bookingCollection = getCollection("bookings")
 const categoryAndRoomCollection = getCollection("categoryandroom")
 const outOfOrderCollection = getCollection("out_of_order")
+const extraServicesCollection = getCollection("extra_services")
+
+const getTodayDateStr = () => {
+    try {
+        return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Dhaka' }).format(new Date())
+    } catch (e) {
+        return new Date().toISOString().split('T')[0]
+    }
+}
+
+const applyDuePriceSchedules = async (targetCategoryId = null) => {
+    try {
+        const todayStr = getTodayDateStr()
+        let query
+        if (targetCategoryId) {
+            const catId = toObjectId(targetCategoryId) || targetCategoryId
+            query = {
+                _id: catId,
+                scheduledPrices: { $elemMatch: { effectiveDate: { $lte: todayStr } } }
+            }
+        } else {
+            query = {
+                scheduledPrices: { $elemMatch: { effectiveDate: { $lte: todayStr } } }
+            }
+        }
+
+        const categories = await categoryAndRoomCollection.find(query).toArray()
+        if (!categories || categories.length === 0) return
+
+        for (const cat of categories) {
+            const scheduledPrices = Array.isArray(cat.scheduledPrices) ? cat.scheduledPrices : []
+            const dueSchedules = scheduledPrices
+                .filter(sp => sp && sp.effectiveDate && sp.effectiveDate <= todayStr)
+                .sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate))
+
+            if (dueSchedules.length === 0) continue
+
+            const remainingSchedules = scheduledPrices.filter(sp => !sp || !sp.effectiveDate || sp.effectiveDate > todayStr)
+
+            let currentPrice = Number(cat.price || 0)
+            const newHistoryEntries = []
+
+            for (const sp of dueSchedules) {
+                const targetPrice = Number(sp.price)
+                if (!isNaN(targetPrice)) {
+                    newHistoryEntries.push({
+                        id: sp.id || Math.random().toString(36).slice(2, 9),
+                        previousPrice: currentPrice,
+                        newPrice: targetPrice,
+                        effectiveDate: sp.effectiveDate,
+                        note: sp.note || "",
+                        appliedAt: new Date()
+                    })
+                    currentPrice = targetPrice
+                }
+            }
+
+            const updateOps = {
+                $set: {
+                    price: currentPrice,
+                    scheduledPrices: remainingSchedules,
+                    updatedAt: new Date()
+                }
+            }
+
+            if (newHistoryEntries.length > 0) {
+                updateOps.$push = {
+                    priceHistory: { $each: newHistoryEntries }
+                }
+            }
+
+            await categoryAndRoomCollection.updateOne({ _id: cat._id }, updateOps)
+        }
+    } catch (err) {
+        console.error("applyDuePriceSchedules error:", err)
+    }
+}
 
 // Initialize indexes and cron in background without blocking startup / route registration
 if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
     ensureBookingIdIndex(bookingCollection).catch(err => console.log("Index init error:", err.message))
     startRequestBookingAutoCancelJob(bookingCollection)
+    cron.schedule("*/5 * * * *", () => {
+        applyDuePriceSchedules().catch(e => console.log("Cron price schedule check error:", e.message))
+    })
+    applyDuePriceSchedules().catch(e => console.log("Startup price schedule check error:", e.message))
 }
 
 // Simplified fast auth pass-through (no JWT bottlenecks)
@@ -1542,9 +1636,12 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             if (name !== undefined) updateData.name = name
             if (mobile !== undefined) updateData.mobile = mobile
             if (address !== undefined) updateData.address = address
-            if (userEmail !== undefined) updateData.userEmail = userEmail
-            if (Array.isArray(rooms)) updateData.rooms = rooms
-            if (totalAmount !== undefined) updateData.totalAmount = Number(totalAmount)
+            if (Array.isArray(rooms)) {
+                updateData.rooms = rooms.map(r => ({
+                    ...r,
+                    nights: Number(r.nights) || getNightCount(r.checkIn || currentDoc.checkIn, r.checkOut || currentDoc.checkOut) || 1
+                }))
+            }
             if (paidAmount !== undefined) updateData.paidAmount = Number(paidAmount)
             if (discountAmount !== undefined) updateData.discountAmount = Number(discountAmount)
             if (advanceAmount !== undefined) updateData.advanceAmount = Number(advanceAmount)
@@ -2146,6 +2243,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         // CATEGORY & ROOM ..............................................
         app.get("/categoryandroom", async (req, res) => {
             try {
+                await applyDuePriceSchedules()
                 const { search, category, sort } = req.query
                 const match = {}
 
@@ -2215,6 +2313,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
         app.get("/categoryandroom/:id", async (req, res) => {
             const { id } = req.params
+            await applyDuePriceSchedules(id)
             const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
             let result = await categoryAndRoomCollection.findOne(query)
             if (!result) {
@@ -2348,6 +2447,65 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             res.send(result)
         })
 
+        // --- Extra Services Endpoints ---
+        app.get("/extra-services", async (req, res) => {
+            try {
+                const result = await extraServicesCollection.find({}).sort({ createdAt: -1 }).toArray()
+                res.send(result)
+            } catch (error) {
+                res.status(500).send({ message: error.message })
+            }
+        })
+
+        app.post("/extra-services", async (req, res) => {
+            try {
+                const service = {
+                    name: req.body.name,
+                    category: req.body.category || "General",
+                    price: Number(req.body.price || 0),
+                    currency: req.body.currency || "৳",
+                    billingType: req.body.billingType || "Per Night",
+                    description: req.body.description || "",
+                    active: req.body.active !== undefined ? req.body.active : true,
+                    popular: !!req.body.popular,
+                    createdAt: new Date()
+                }
+                const result = await extraServicesCollection.insertOne(service)
+                res.send({ acknowledged: true, insertedId: result.insertedId, ...service })
+            } catch (error) {
+                res.status(500).send({ message: error.message })
+            }
+        })
+
+        app.patch("/extra-services/:id", async (req, res) => {
+            try {
+                const { id } = req.params
+                const query = { _id: toObjectId(id) || id }
+                const update = { $set: {} }
+                if (req.body.active !== undefined) update.$set.active = req.body.active
+                if (req.body.name !== undefined) update.$set.name = req.body.name
+                if (req.body.category !== undefined) update.$set.category = req.body.category
+                if (req.body.price !== undefined) update.$set.price = Number(req.body.price || 0)
+                if (req.body.billingType !== undefined) update.$set.billingType = req.body.billingType
+                if (req.body.description !== undefined) update.$set.description = req.body.description
+                const result = await extraServicesCollection.updateOne(query, update)
+                res.send(result)
+            } catch (error) {
+                res.status(500).send({ message: error.message })
+            }
+        })
+
+        app.delete("/extra-services/:id", async (req, res) => {
+            try {
+                const { id } = req.params
+                const query = { _id: toObjectId(id) || id }
+                const result = await extraServicesCollection.deleteOne(query)
+                res.send(result)
+            } catch (error) {
+                res.status(500).send({ message: error.message })
+            }
+        })
+
         // ADMIN OVERVIEW & INCOME ..............................................
         app.get("/admin/overview", verifyFBToken, verifyAdmin, async (req, res) => {
             const now = new Date()
@@ -2373,7 +2531,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }]).toArray())[0]
 
             const allBookings = await bookingCollection.find().toArray()
-            const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
+            const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection, categoryAndRoomCollection)
             const revenueBookings = hydratedBookings.filter(isRevenueBooking)
             const totalRevenue = revenueBookings.reduce((total, booking) => total + getBookingRevenue(booking), 0)
 
@@ -2447,7 +2605,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             try {
                 const { startDate, endDate } = req.query
                 const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
-                const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection)
+                const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection, categoryAndRoomCollection)
                 
                 let revenueBookings = hydratedBookings.filter(isRevenueBooking)
 
@@ -2528,6 +2686,8 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             checkIn: room.checkIn,
                             checkOut: room.checkOut,
                             nights,
+                            adults: Number(room.adults !== undefined ? room.adults : (booking.adults || 1)),
+                            children: Number(room.children !== undefined ? room.children : (room.babies !== undefined ? room.babies : (booking.children || booking.babies || 0))),
                             amount: rTotal,
                             reference: booking.reference || "",
                             transactionId: booking.transactionId || "",
@@ -2682,12 +2842,58 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     return res.status(400).send({ message: "Effective date and valid price are required." })
                 }
 
-                const query = { _id: new ObjectId(id) }
+                const catId = toObjectId(id) || id
+                const query = { _id: catId }
+                const category = await categoryAndRoomCollection.findOne(query)
+                if (!category) {
+                    return res.status(404).send({ message: "Category not found." })
+                }
+
+                const todayStr = getTodayDateStr()
+                const targetPrice = Number(price)
+
+                // If scheduled date has already arrived or is today, apply immediately
+                if (effectiveDate <= todayStr) {
+                    const currentPrice = Number(category.price || 0)
+                    const historyEntry = {
+                        id: Math.random().toString(36).slice(2, 9),
+                        previousPrice: currentPrice,
+                        newPrice: targetPrice,
+                        effectiveDate,
+                        note: note ? String(note).trim() : "",
+                        appliedAt: new Date()
+                    }
+
+                    // Remove any existing entry for this exact effectiveDate first
+                    await categoryAndRoomCollection.updateOne(query, {
+                        $pull: { scheduledPrices: { effectiveDate } }
+                    })
+
+                    const result = await categoryAndRoomCollection.updateOne(query, {
+                        $set: {
+                            price: targetPrice,
+                            updatedAt: new Date()
+                        },
+                        $push: {
+                            priceHistory: historyEntry
+                        }
+                    })
+
+                    return res.send({
+                        success: true,
+                        appliedImmediately: true,
+                        entry: historyEntry,
+                        message: `Price updated to ৳${targetPrice.toLocaleString()} and previous price saved to history.`,
+                        result
+                    })
+                }
+
+                // Future scheduled price: keep in Active Price Schedules
                 const scheduleEntry = {
                     id: Math.random().toString(36).slice(2, 9),
                     effectiveDate,
-                    price: Number(price),
-                    note: note || "",
+                    price: targetPrice,
+                    note: note ? String(note).trim() : "",
                     createdAt: new Date()
                 }
 
@@ -2701,18 +2907,25 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     $set: { updatedAt: new Date() }
                 })
 
-                res.send({ success: true, entry: scheduleEntry, result })
+                res.send({
+                    success: true,
+                    appliedImmediately: false,
+                    entry: scheduleEntry,
+                    message: `Price of ৳${targetPrice.toLocaleString()} scheduled for ${effectiveDate}.`,
+                    result
+                })
             } catch (err) {
                 console.error("Schedule price error:", err)
                 res.status(500).send({ message: "Failed to schedule price change." })
             }
         })
 
-        // Delete Scheduled Price
+        // Delete / Cancel Scheduled Price (only removes from scheduledPrices, never history)
         app.delete("/categoryandroom/:id/schedule-price/:effectiveDate", async (req, res) => {
             try {
                 const { id, effectiveDate } = req.params
-                const query = { _id: new ObjectId(id) }
+                const catId = toObjectId(id) || id
+                const query = { _id: catId }
                 const result = await categoryAndRoomCollection.updateOne(query, {
                     $pull: { scheduledPrices: { effectiveDate } },
                     $set: { updatedAt: new Date() }
