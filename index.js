@@ -202,7 +202,13 @@ const getRoomTotal = (room = {}) => {
 }
 
 const getBookingSubtotal = (booking = {}) => {
-    const extraCost = Number(booking.extraServiceCost || 0)
+    const extraCost = Number(
+        booking.extraServiceCost ||
+        (Array.isArray(booking.extraServices)
+            ? booking.extraServices.reduce((sum, s) => sum + Number(s.totalCost || (Number(s.unitPrice || 0) * Number(s.quantity || 1)) || 0), 0)
+            : booking.extraServices?.totalCost) ||
+        0
+    )
     const rooms = getBookingRooms(booking)
     if (rooms.length) {
         const total = rooms.reduce((sum, room) => sum + getRoomTotal(room), 0)
@@ -219,18 +225,6 @@ const getBookingDiscount = (booking = {}) => {
 const getBookingTotal = (booking = {}) => {
     const subtotal = getBookingSubtotal(booking)
     const discount = getBookingDiscount(booking)
-
-    if (booking.totalAmount !== undefined && booking.totalAmount !== null && !isNaN(Number(booking.totalAmount))) {
-        const t = Number(booking.totalAmount)
-        // If stored totalAmount equals subtotal and there is a discount, net payable is subtotal - discount
-        if (discount > 0 && Math.abs(t - subtotal) < 0.01) {
-            return Math.max(0, subtotal - discount)
-        }
-        // If stored totalAmount is explicitly set (e.g. customized authority price)
-        if (t > 0 && t <= subtotal) {
-            return t
-        }
-    }
 
     return Math.max(0, subtotal - discount)
 }
@@ -404,6 +398,7 @@ const bookingCollection = getCollection("bookings")
 const categoryAndRoomCollection = getCollection("categoryandroom")
 const outOfOrderCollection = getCollection("out_of_order")
 const extraServicesCollection = getCollection("extra_services")
+const settingsCollection = getCollection("settings")
 
 const getTodayDateStr = () => {
     try {
@@ -525,6 +520,23 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                 if (user && user.role !== "admin") {
                     return res.status(403).send({ message: "Forbidden: Only Admin can delete categories." })
                 }
+            }
+            next()
+        }
+
+        // Strict Admin or Manager middleware for room maintenance operations (Out of Order)
+        const verifyAdminOrManager = async (req, res, next) => {
+            const email = req.decodedEmail || req.headers['x-user-email'] || req.body?.createdBy?.email || req.body?.resolvedBy?.email
+            const roleInBody = String(req.body?.createdBy?.role || req.body?.resolvedBy?.role || '').trim().toLowerCase()
+
+            if (email) {
+                const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
+                const role = String(user?.role || roleInBody || '').trim().toLowerCase()
+                if (role && !["admin", "manager"].includes(role)) {
+                    return res.status(403).send({ message: "Forbidden: Only Admin or Manager can modify Out of Order status." })
+                }
+            } else if (roleInBody && !["admin", "manager"].includes(roleInBody)) {
+                return res.status(403).send({ message: "Forbidden: Only Admin or Manager can modify Out of Order status." })
             }
             next()
         }
@@ -1090,16 +1102,18 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
                     const effectivePaid = Number(data.paidAmount !== undefined ? data.paidAmount : (data.advanceAmount || 0))
                     if (isNaN(effectivePaid) || effectivePaid < 0) {
-                        return res.status(400).send({ message: "Payment Done amount must be greater than 0 for confirmed bookings." })
+                        return res.status(400).send({ message: "Payment Done amount cannot be negative." })
                     }
 
-                    if (!data.paymentMethod || !String(data.paymentMethod).trim()) {
-                        return res.status(400).send({ message: "Payment Method is required for confirmed bookings." })
-                    }
+                    if (effectivePaid > 0) {
+                        if (!data.paymentMethod || !String(data.paymentMethod).trim()) {
+                            return res.status(400).send({ message: "Payment Method is required for confirmed bookings with payment." })
+                        }
 
-                    const isDigitalMethod = !["Cash", "Other"].includes(String(data.paymentMethod).trim())
-                    if (isDigitalMethod && (!data.transactionId || !String(data.transactionId).trim())) {
-                        return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${data.paymentMethod}.` })
+                        const isDigitalMethod = !["Cash", "Other"].includes(String(data.paymentMethod).trim())
+                        if (isDigitalMethod && (!data.transactionId || !String(data.transactionId).trim())) {
+                            return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${data.paymentMethod}.` })
+                        }
                     }
 
                     if (!data.reference || !String(data.reference).trim()) {
@@ -1157,16 +1171,24 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     }]
                 }
 
+                const roomTotal = rooms.reduce((sum, r) => sum + getRoomTotal(r), 0)
+                const computedBookingTotal = Math.max(0, roomTotal + resolvedExtraServiceCost - Number(data.discountAmount || 0))
+                const finalTotalAmount = data.totalAmount !== undefined && data.totalAmount !== null && !isNaN(Number(data.totalAmount))
+                    ? Number(data.totalAmount)
+                    : computedBookingTotal
+                const finalPaidAmount = data.paidAmount !== undefined ? Number(data.paidAmount) : 0
+                const finalDueAmount = data.dueAmount !== undefined ? Number(data.dueAmount) : Math.max(0, finalTotalAmount - finalPaidAmount)
+
                 const bookingData = {
                     name: data.name,
                     mobile: data.mobile,
                     address: data.address || "",
                     userEmail: data.userEmail || data.email || "",
                     rooms,
-                    totalAmount: data.totalAmount !== undefined ? Number(data.totalAmount) : undefined,
+                    totalAmount: finalTotalAmount,
                     discountAmount: Number(data.discountAmount || 0),
-                    paidAmount: data.paidAmount !== undefined ? Number(data.paidAmount) : 0,
-                    dueAmount: data.dueAmount !== undefined ? Number(data.dueAmount) : Math.max(0, Number(data.totalAmount || 0) - Number(data.paidAmount || 0)),
+                    paidAmount: finalPaidAmount,
+                    dueAmount: finalDueAmount,
                     paymentMethod: data.paymentMethod || "Cash",
                     paymentHistory: data.paidAmount && Number(data.paidAmount) > 0 ? [{
                         amount: Number(data.paidAmount),
@@ -1708,6 +1730,25 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
             if (req.body.paymentMethod !== undefined) updateData.paymentMethod = req.body.paymentMethod
 
+            // Total amount and due amount persistence & auto-recalculation
+            if (totalAmount !== undefined && totalAmount !== null && !isNaN(Number(totalAmount))) {
+                updateData.totalAmount = Number(totalAmount)
+            } else if (updateData.rooms !== undefined || updateData.extraServices !== undefined || updateData.extraServiceCost !== undefined || updateData.discountAmount !== undefined) {
+                const effectiveRooms = updateData.rooms || currentDoc.rooms || []
+                const effectiveExtraCost = updateData.extraServiceCost !== undefined ? updateData.extraServiceCost : Number(currentDoc.extraServiceCost || 0)
+                const effectiveDiscount = updateData.discountAmount !== undefined ? updateData.discountAmount : Number(currentDoc.discountAmount || 0)
+                const roomTotal = effectiveRooms.reduce((sum, r) => sum + getRoomTotal(r), 0)
+                updateData.totalAmount = Math.max(0, roomTotal + effectiveExtraCost - effectiveDiscount)
+            }
+
+            if (req.body.dueAmount !== undefined && req.body.dueAmount !== null && !isNaN(Number(req.body.dueAmount))) {
+                updateData.dueAmount = Number(req.body.dueAmount)
+            } else if (updateData.totalAmount !== undefined || updateData.paidAmount !== undefined) {
+                const effectiveTotal = updateData.totalAmount !== undefined ? updateData.totalAmount : Number(currentDoc.totalAmount || 0)
+                const effectivePaid = updateData.paidAmount !== undefined ? updateData.paidAmount : Number(currentDoc.paidAmount || currentDoc.advanceAmount || 0)
+                updateData.dueAmount = Math.max(0, effectiveTotal - effectivePaid)
+            }
+
             const update = { $set: updateData }
 
             // Detect and record fine-grained field changes into editHistory
@@ -1827,18 +1868,20 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
                     const effectivePaid = Number(updateData.paidAmount !== undefined ? updateData.paidAmount : (currentDoc?.paidAmount || 0))
                     if (isNaN(effectivePaid) || effectivePaid < 0) {
-                        return res.status(400).send({ message: "Payment Done amount must be greater than 0 for confirmed bookings." })
+                        return res.status(400).send({ message: "Payment Done amount cannot be negative." })
                     }
 
-                    const effectiveMethod = updateData.paymentMethod || currentDoc?.paymentMethod
-                    if (!effectiveMethod || !String(effectiveMethod).trim()) {
-                        return res.status(400).send({ message: "Payment Method is required for confirmed bookings." })
-                    }
+                    if (effectivePaid > 0) {
+                        const effectiveMethod = updateData.paymentMethod || currentDoc?.paymentMethod
+                        if (!effectiveMethod || !String(effectiveMethod).trim()) {
+                            return res.status(400).send({ message: "Payment Method is required for confirmed bookings with payment." })
+                        }
 
-                    const isDigitalMethod = !["Cash", "Other"].includes(String(effectiveMethod).trim())
-                    const effectiveTrx = updateData.transactionId !== undefined ? updateData.transactionId : (currentDoc?.transactionId || "")
-                    if (isDigitalMethod && (!effectiveTrx || !String(effectiveTrx).trim())) {
-                        return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${effectiveMethod}.` })
+                        const isDigitalMethod = !["Cash", "Other"].includes(String(effectiveMethod).trim())
+                        const effectiveTrx = updateData.transactionId !== undefined ? updateData.transactionId : (currentDoc?.transactionId || "")
+                        if (isDigitalMethod && (!effectiveTrx || !String(effectiveTrx).trim())) {
+                            return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${effectiveMethod}.` })
+                        }
                     }
 
                     const effectiveRef = updateData.reference !== undefined ? updateData.reference : (currentDoc?.reference || "")
@@ -2066,11 +2109,13 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             discountAmount,
                             extraService: booking.extraService || "",
                             extraServiceCost: Number(booking.extraServiceCost || 0),
+                            extraServices: Array.isArray(booking.extraServices) ? booking.extraServices : [],
                             paymentMethod: booking.paymentMethod || "M-Banking Advance",
                             paymentHistory: Array.isArray(booking.paymentHistory) ? booking.paymentHistory : []
                         },
                         extraService: booking.extraService || "",
                         extraServiceCost: Number(booking.extraServiceCost || 0),
+                        extraServices: Array.isArray(booking.extraServices) ? booking.extraServices : [],
                         paymentHistory: Array.isArray(booking.paymentHistory) ? booking.paymentHistory : [],
                         reference: creator,
                         notes: booking.notes || ""
@@ -2101,6 +2146,12 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                 const booking = await bookingCollection.findOne(query)
                 if (!booking) {
                     return res.status(404).send({ message: "Reservation not found." })
+                }
+
+                if (booking.status === BOOKING_STATUS.REQUEST_BOOKING || booking.status === "pending") {
+                    return res.status(400).send({
+                        message: "Payment cannot be collected on a pending request booking. Please confirm the booking first."
+                    })
                 }
 
                 const currentDue = getBookingDueAmount(booking)
@@ -2193,11 +2244,15 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.post("/out-of-order", async (req, res) => {
+        app.post("/out-of-order", verifyFBToken, verifyAdminOrManager, async (req, res) => {
             try {
                 const { roomNo, categoryId, categoryName, startDate, endDate, reason, notes, createdBy } = req.body
                 if (!roomNo || !startDate || !endDate) {
                     return res.status(400).send({ message: "Room number, Start date, and End date are required." })
+                }
+
+                if (new Date(startDate) >= new Date(endDate)) {
+                    return res.status(400).send({ message: "End date must be after start date." })
                 }
 
                 const cleanRoomNo = String(roomNo).trim()
@@ -2229,6 +2284,34 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                     })
                 }
 
+                // If this room already has an active Out of Order record, update it instead of creating duplicates
+                const existingActiveOOO = await outOfOrderCollection.findOne({
+                    roomNo: cleanRoomNo,
+                    status: "active"
+                })
+
+                if (existingActiveOOO) {
+                    const updateDoc = {
+                        $set: {
+                            startDate,
+                            endDate,
+                            reason: reason || existingActiveOOO.reason || "Maintenance / Repair",
+                            notes: notes !== undefined ? notes : (existingActiveOOO.notes || ""),
+                            categoryId: categoryId || existingActiveOOO.categoryId || "",
+                            categoryName: categoryName || existingActiveOOO.categoryName || "",
+                            updatedAt: new Date(),
+                            updatedBy: {
+                                email: req.decodedEmail || "",
+                                name: createdBy?.name || "Staff / Admin",
+                                role: createdBy?.role || "admin"
+                            }
+                        }
+                    }
+                    await outOfOrderCollection.updateOne({ _id: existingActiveOOO._id }, updateDoc)
+                    const updated = await outOfOrderCollection.findOne({ _id: existingActiveOOO._id })
+                    return res.send(updated)
+                }
+
                 const doc = {
                     roomNo: cleanRoomNo,
                     categoryId: categoryId || "",
@@ -2255,36 +2338,84 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.patch("/out-of-order/:id", async (req, res) => {
+        app.patch("/out-of-order/:id", verifyFBToken, verifyAdminOrManager, async (req, res) => {
             try {
                 const { id } = req.params
-                const { status, resolvedBy, reason, notes } = req.body
+                const { status, resolvedBy, reason, notes, startDate, endDate } = req.body
                 const objectId = toObjectId(id)
                 const query = objectId ? { _id: objectId } : { _id: id }
 
+                const existingRecord = await outOfOrderCollection.findOne(query)
+                if (!existingRecord) {
+                    return res.status(404).send({ message: "Out of order record not found." })
+                }
+
+                const targetStartDate = startDate || existingRecord.startDate
+                const targetEndDate = endDate || existingRecord.endDate
+                const roomNo = existingRecord.roomNo
+
+                if (startDate || endDate) {
+                    if (new Date(targetStartDate) >= new Date(targetEndDate)) {
+                        return res.status(400).send({ message: "End date must be after start date." })
+                    }
+
+                    // Prevent changing dates if an active booking is overlapping
+                    const conflictingBooking = await bookingCollection.findOne({
+                        status: { $in: ACTIVE_BOOKING_STATUSES },
+                        $or: [
+                            {
+                                rooms: {
+                                    $elemMatch: {
+                                        roomNo: roomNo,
+                                        checkIn: { $lt: targetEndDate },
+                                        checkOut: { $gt: targetStartDate }
+                                    }
+                                }
+                            },
+                            {
+                                roomNo: roomNo,
+                                checkIn: { $lt: targetEndDate },
+                                checkOut: { $gt: targetStartDate }
+                            }
+                        ]
+                    })
+
+                    if (conflictingBooking) {
+                        return res.status(409).send({
+                            message: `Cannot update maintenance dates: Room ${roomNo} has an active reservation (${conflictingBooking.bookingId} - ${conflictingBooking.name}) from ${targetStartDate} to ${targetEndDate}.`
+                        })
+                    }
+                }
+
                 const updateDoc = {
                     $set: {
-                        status: status || "resolved",
-                        resolvedAt: new Date(),
-                        resolvedBy: resolvedBy || {
-                            email: req.decodedEmail || "",
-                            name: "Staff / Admin",
-                            role: "admin"
-                        },
+                        ...(status ? { status } : {}),
+                        ...(status === "resolved" ? {
+                            resolvedAt: new Date(),
+                            resolvedBy: resolvedBy || {
+                                email: req.decodedEmail || "",
+                                name: "Staff / Admin",
+                                role: "admin"
+                            }
+                        } : {}),
+                        ...(startDate ? { startDate } : {}),
+                        ...(endDate ? { endDate } : {}),
                         ...(reason ? { reason } : {}),
-                        ...(notes !== undefined ? { notes } : {})
+                        ...(notes !== undefined ? { notes } : {}),
+                        updatedAt: new Date()
                     }
                 }
 
                 const result = await outOfOrderCollection.updateOne(query, updateDoc)
-                res.send(result)
+                const updated = await outOfOrderCollection.findOne(query)
+                res.send(updated || result)
             } catch (err) {
                 console.error("Update out of order error:", err)
                 res.status(500).send({ message: "Failed to update out of order status." })
             }
         })
 
-        app.delete("/out-of-order/:id", async (req, res) => {
+        app.delete("/out-of-order/:id", verifyFBToken, verifyAdminOrManager, async (req, res) => {
             try {
                 const { id } = req.params
                 const objectId = toObjectId(id)
@@ -2562,6 +2693,201 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
+        // --- Settings: Extra Services Billing Types Endpoints ---
+        const DEFAULT_BILLING_TYPES = [
+            { id: "per_night", name: "Per Night", unitLabel: "night", description: "Billed per night of stay" },
+            { id: "per_person", name: "Per Person", unitLabel: "person", description: "Billed per guest count" },
+            { id: "per_quantity", name: "Per Quantity", unitLabel: "item", description: "Billed per item / quantity" },
+            { id: "one_time", name: "One-time", unitLabel: "time", description: "Fixed one-time service fee" }
+        ]
+
+        const getOrSeedBillingTypes = async () => {
+            let doc = await settingsCollection.findOne({ _id: "general_settings" })
+            if (!doc) {
+                doc = await settingsCollection.findOne({ "extraServices.billingType": { $exists: true } })
+            }
+            if (!doc || !Array.isArray(doc?.extraServices?.billingType) || doc.extraServices.billingType.length === 0) {
+                const initialDoc = {
+                    _id: "general_settings",
+                    extraServices: {
+                        billingType: DEFAULT_BILLING_TYPES
+                    },
+                    updatedAt: new Date()
+                }
+                await settingsCollection.updateOne(
+                    { _id: "general_settings" },
+                    { $set: initialDoc },
+                    { upsert: true }
+                )
+                return DEFAULT_BILLING_TYPES
+            }
+            return doc.extraServices.billingType
+        }
+
+        app.get("/settings/extra-services/billing-types", async (req, res) => {
+            try {
+                const billingTypes = await getOrSeedBillingTypes()
+                res.send(billingTypes)
+            } catch (error) {
+                console.error("Failed to load billing types:", error)
+                res.status(500).send({ message: error.message })
+            }
+        })
+
+        app.post("/settings/extra-services/billing-types", async (req, res) => {
+            try {
+                const { name, unitLabel, description } = req.body || {}
+                const cleanName = String(name || "").trim()
+                if (!cleanName) {
+                    return res.status(400).send({ message: "Billing type name is required." })
+                }
+
+                const currentTypes = await getOrSeedBillingTypes()
+                const exists = currentTypes.some(bt => {
+                    const btName = typeof bt === 'string' ? bt : bt.name
+                    return String(btName).toLowerCase() === cleanName.toLowerCase()
+                })
+                if (exists) {
+                    return res.status(400).send({ message: `Billing type "${cleanName}" already exists.` })
+                }
+
+                const newType = {
+                    id: `bt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                    name: cleanName,
+                    unitLabel: String(unitLabel || "unit").trim() || "unit",
+                    description: String(description || "").trim(),
+                    createdAt: new Date()
+                }
+
+                await settingsCollection.updateOne(
+                    { _id: "general_settings" },
+                    { 
+                        $push: { "extraServices.billingType": newType },
+                        $set: { updatedAt: new Date() }
+                    },
+                    { upsert: true }
+                )
+
+                const updated = await getOrSeedBillingTypes()
+                res.send({ acknowledged: true, insertedType: newType, billingTypes: updated })
+            } catch (error) {
+                console.error("Failed to add billing type:", error)
+                res.status(500).send({ message: error.message })
+            }
+        })
+
+        app.patch("/settings/extra-services/billing-types/:id", async (req, res) => {
+            try {
+                const { id } = req.params
+                const { name, unitLabel, description } = req.body || {}
+                const cleanName = name !== undefined ? String(name).trim() : undefined
+                if (cleanName !== undefined && !cleanName) {
+                    return res.status(400).send({ message: "Billing type name cannot be empty." })
+                }
+
+                const currentTypes = await getOrSeedBillingTypes()
+                const targetIndex = currentTypes.findIndex(bt => {
+                    if (typeof bt === 'string') return bt === id
+                    return String(bt.id) === String(id) || String(bt.name).toLowerCase() === String(id).toLowerCase()
+                })
+
+                if (targetIndex === -1) {
+                    return res.status(404).send({ message: "Billing type not found." })
+                }
+
+                const oldType = currentTypes[targetIndex]
+                const oldName = typeof oldType === 'string' ? oldType : oldType.name
+
+                if (cleanName && cleanName.toLowerCase() !== oldName.toLowerCase()) {
+                    const nameExists = currentTypes.some((bt, idx) => {
+                        if (idx === targetIndex) return false
+                        const btName = typeof bt === 'string' ? bt : bt.name
+                        return String(btName).toLowerCase() === cleanName.toLowerCase()
+                    })
+                    if (nameExists) {
+                        return res.status(400).send({ message: `Another billing type named "${cleanName}" already exists.` })
+                    }
+                }
+
+                const updatedType = {
+                    ...(typeof oldType === 'object' ? oldType : { id: `bt_${Date.now()}` }),
+                    name: cleanName !== undefined ? cleanName : oldName,
+                    unitLabel: unitLabel !== undefined ? String(unitLabel).trim() : (oldType.unitLabel || "unit"),
+                    description: description !== undefined ? String(description).trim() : (oldType.description || ""),
+                    updatedAt: new Date()
+                }
+
+                currentTypes[targetIndex] = updatedType
+
+                await settingsCollection.updateOne(
+                    { _id: "general_settings" },
+                    { 
+                        $set: { 
+                            "extraServices.billingType": currentTypes,
+                            updatedAt: new Date()
+                        }
+                    },
+                    { upsert: true }
+                )
+
+                if (cleanName && cleanName !== oldName) {
+                    await extraServicesCollection.updateMany(
+                        { billingType: oldName },
+                        { $set: { billingType: cleanName } }
+                    )
+                }
+
+                res.send({ acknowledged: true, updatedType, billingTypes: currentTypes })
+            } catch (error) {
+                console.error("Failed to update billing type:", error)
+                res.status(500).send({ message: error.message })
+            }
+        })
+
+        app.delete("/settings/extra-services/billing-types/:id", async (req, res) => {
+            try {
+                const { id } = req.params
+                const currentTypes = await getOrSeedBillingTypes()
+                const targetIndex = currentTypes.findIndex(bt => {
+                    if (typeof bt === 'string') return bt === id
+                    return String(bt.id) === String(id) || String(bt.name).toLowerCase() === String(id).toLowerCase()
+                })
+
+                if (targetIndex === -1) {
+                    return res.status(404).send({ message: "Billing type not found." })
+                }
+
+                const targetType = currentTypes[targetIndex]
+                const targetName = typeof targetType === 'string' ? targetType : targetType.name
+
+                const inUseCount = await extraServicesCollection.countDocuments({ billingType: targetName })
+                if (inUseCount > 0 && !req.query.force) {
+                    return res.status(400).send({ 
+                        message: `Cannot delete "${targetName}" because it is currently assigned to ${inUseCount} extra service(s). Please edit or reassign those services first.`,
+                        inUseCount
+                    })
+                }
+
+                const updatedTypes = currentTypes.filter((_, idx) => idx !== targetIndex)
+
+                await settingsCollection.updateOne(
+                    { _id: "general_settings" },
+                    { 
+                        $set: { 
+                            "extraServices.billingType": updatedTypes,
+                            updatedAt: new Date()
+                        }
+                    },
+                    { upsert: true }
+                )
+
+                res.send({ acknowledged: true, deletedName: targetName, billingTypes: updatedTypes })
+            } catch (error) {
+                console.error("Failed to delete billing type:", error)
+                res.status(500).send({ message: error.message })
+            }
+        })
+
         // ADMIN OVERVIEW & INCOME ..............................................
         app.get("/admin/overview", verifyFBToken, verifyAdmin, async (req, res) => {
             const now = new Date()
@@ -2726,9 +3052,12 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             }
                         }
                         const nights = getNightCount(room.checkIn, room.checkOut)
+                        const extraCost = Number(booking.extraServiceCost || 0)
+                        const discount = Number(booking.discountAmount || 0)
+                        const roomRatio = (getRoomTotal(room) || 1) / totalRoomPrice
                         const rTotal = isCancelled
-                            ? (((getRoomTotal(room) || 1) / totalRoomPrice) * retainedPaid)
-                            : getRoomTotal(room)
+                            ? (roomRatio * retainedPaid)
+                            : Math.max(0, getRoomTotal(room) + (roomRatio * (extraCost - discount)))
 
                         roomStats[label].totalRevenue += rTotal
                         roomStats[label].bookingCount += 1
@@ -2836,9 +3165,12 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
                     rooms.forEach(room => {
                         const catLabel = room.categoryName || room.room?.name || room.room?.category || "Standard Room"
+                        const extraCost = Number(booking.extraServiceCost || 0)
+                        const discount = Number(booking.discountAmount || 0)
+                        const roomRatio = (getRoomTotal(room) || 1) / totalRoomPrice
                         const rTotal = isCancelled
-                            ? (((getRoomTotal(room) || 1) / totalRoomPrice) * retainedPaid)
-                            : getRoomTotal(room)
+                            ? (roomRatio * retainedPaid)
+                            : Math.max(0, getRoomTotal(room) + (roomRatio * (extraCost - discount)))
                         const nights = getNightCount(room.checkIn, room.checkOut)
 
                         categoryBreakdownMap[catLabel] = (categoryBreakdownMap[catLabel] || 0) + rTotal
