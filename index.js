@@ -175,6 +175,16 @@ const ensureBookingIdIndex = async (bookingCollection) => {
     if (!statusIndex) {
         await bookingCollection.createIndex({ status: 1 })
     }
+
+    const roomCheckInIndex = indexes.find(index => index.key?.["rooms.checkIn"] === 1)
+    if (!roomCheckInIndex) {
+        await bookingCollection.createIndex({ "rooms.checkIn": 1 })
+    }
+
+    const roomCheckOutIndex = indexes.find(index => index.key?.["rooms.checkOut"] === 1)
+    if (!roomCheckOutIndex) {
+        await bookingCollection.createIndex({ "rooms.checkOut": 1 })
+    }
 }
 
 const toObjectId = (value) => {
@@ -1358,12 +1368,46 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
         app.get("/bookings", verifyFBToken, async (req, res) => {
             try {
-                const { email, status, reference, search, skip, limit } = req.query
+                const { email, status, reference, search, skip, limit, startDate, endDate } = req.query
                 const isPaginated = skip !== undefined || limit !== undefined
                 const parsedLimit = limit !== undefined ? Math.max(1, parseInt(limit, 10) || 25) : 0
                 const parsedSkip = skip !== undefined ? Math.max(0, parseInt(skip, 10) || 0) : 0
 
                 const andConditions = []
+
+                const cleanStartDate = typeof startDate === 'string' ? startDate.trim() : null
+                const cleanEndDate = typeof endDate === 'string' ? endDate.trim() : null
+
+                if (cleanStartDate || cleanEndDate) {
+                    let endThreshold = cleanEndDate
+                    if (cleanEndDate && /^\d{4}-\d{2}-\d{2}$/.test(cleanEndDate)) {
+                        const nextDay = new Date(`${cleanEndDate}T00:00:00`)
+                        nextDay.setDate(nextDay.getDate() + 1)
+                        const y = nextDay.getFullYear()
+                        const m = String(nextDay.getMonth() + 1).padStart(2, '0')
+                        const d = String(nextDay.getDate()).padStart(2, '0')
+                        endThreshold = `${y}-${m}-${d}`
+                    }
+
+                    const roomElemMatch = {}
+                    const rootMatch = {}
+
+                    if (endThreshold) {
+                        roomElemMatch.checkIn = { $gte: "1900", $lt: endThreshold }
+                        rootMatch.checkIn = { $gte: "1900", $lt: endThreshold }
+                    }
+                    if (cleanStartDate) {
+                        roomElemMatch.checkOut = { $gt: cleanStartDate }
+                        rootMatch.checkOut = { $gt: cleanStartDate }
+                    }
+
+                    andConditions.push({
+                        $or: [
+                            { rooms: { $elemMatch: roomElemMatch } },
+                            rootMatch
+                        ]
+                    })
+                }
 
                 if (email) {
                     const escEmail = String(email).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
