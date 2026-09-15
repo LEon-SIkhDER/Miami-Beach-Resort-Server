@@ -45,6 +45,45 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET
 })
 
+// Helper to extract Cloudinary public ID from URL or existing ID string
+const extractCloudinaryPublicId = (urlOrId) => {
+    if (!urlOrId || typeof urlOrId !== 'string') return null
+    const trimmed = urlOrId.trim()
+    if (!trimmed) return null
+    if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+        return trimmed.replace(/\.[^/.]+$/, "")
+    }
+    const match = trimmed.match(/\/upload\/(?:v\d+\/)?([^\.\?\#]+)/)
+    return match ? match[1] : null
+}
+
+// Helper to collect all unique Cloudinary public IDs from a category or room document/payload
+const collectCloudinaryPublicIds = (doc) => {
+    if (!doc || typeof doc !== 'object') return []
+    const ids = new Set()
+    const addId = (val) => {
+        const extracted = extractCloudinaryPublicId(val)
+        if (extracted) ids.add(extracted)
+    }
+
+    if (doc.imagePublicId) addId(doc.imagePublicId)
+    if (doc.imageUrl) addId(doc.imageUrl)
+    if (doc.image) addId(doc.image)
+
+    if (Array.isArray(doc.images)) {
+        doc.images.forEach(img => {
+            if (typeof img === 'string') {
+                addId(img)
+            } else if (img && typeof img === 'object') {
+                if (img.publicId) addId(img.publicId)
+                if (img.url) addId(img.url)
+            }
+        })
+    }
+    return Array.from(ids)
+}
+
+
 // mongodb
 const uri = `mongodb+srv://${process.env.DB_USERNAME}:${process.env.DB_PASSWORD}@cluster0.7hhwads.mongodb.net/?appName=Cluster0`
 
@@ -84,6 +123,21 @@ const generateBookingId = () => {
     return `BK-${random}`
 }
 
+const NO_TRANSACTION_ID_METHODS = [
+    "cash",
+    "other",
+    "pay on arrival",
+    "pay on arrival / unpaid",
+    "pending",
+    "unpaid"
+]
+
+const isDigitalPaymentMethod = (method) => {
+    if (!method) return false
+    const clean = String(method).trim().toLowerCase()
+    return !NO_TRANSACTION_ID_METHODS.includes(clean)
+}
+
 const BOOKING_STATUS = {
     REQUEST_BOOKING: "request_booking",
     BOOKING_CONFIRMED: "booking_confirmed",
@@ -113,12 +167,14 @@ const getRequestBookingExpireHours = (role = "default") => {
 const ensureBookingIdIndex = async (bookingCollection) => {
     const indexes = await bookingCollection.indexes()
     const bookingIdIndex = indexes.find(index => index.key?.bookingId === 1)
-
-    if (bookingIdIndex?.unique) {
-        return
+    if (!bookingIdIndex?.unique) {
+        await bookingCollection.createIndex({ bookingId: 1 }, { unique: true })
     }
 
-    await bookingCollection.createIndex({ bookingId: 1 }, { unique: true })
+    const statusIndex = indexes.find(index => index.key?.status === 1)
+    if (!statusIndex) {
+        await bookingCollection.createIndex({ status: 1 })
+    }
 }
 
 const toObjectId = (value) => {
@@ -486,56 +542,60 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
     applyDuePriceSchedules().catch(e => console.log("Startup price schedule check error:", e.message))
 }
 
-// Simplified fast auth pass-through (no JWT bottlenecks)
-        const verifyFBToken = (req, res, next) => {
+        // Firebase JWT (ID Token) verification middleware
+        const verifyFBToken = async (req, res, next) => {
             const authHeader = req.headers.authorization
-            const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : authHeader
-            if (token) {
-                try {
-                    const base64Url = token.split('.')[1]
-                    if (base64Url) {
-                        const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
-                        const payload = JSON.parse(Buffer.from(base64, 'base64').toString('utf-8'))
-                        if (payload?.email) {
-                            req.decodedEmail = payload.email
-                            req.decodedUid = payload.user_id || payload.sub
-                        }
-                    }
-                } catch (e) {}
+            if (!authHeader || !authHeader.startsWith("Bearer ")) {
+                return res.status(401).send({ message: "Unauthorized access: No token provided" })
             }
-            if (req.headers['x-user-email']) req.decodedEmail = req.headers['x-user-email']
-            next()
+            const token = authHeader.split(" ")[1]
+            try {
+                const decodedUser = await admin.auth().verifyIdToken(token)
+                req.user = decodedUser
+                req.decodedEmail = decodedUser.email
+                req.decodedUid = decodedUser.uid
+                next()
+            } catch (error) {
+                console.error("Token verification failed:", error.message)
+                return res.status(401).send({ message: "Unauthorized access: Invalid or expired token" })
+            }
         }
 
-        // admin verify (bypassed for maximum speed)
-        const verifyAdmin = (req, res, next) => {
+        // Admin role verification middleware
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decodedEmail
+            if (!email) {
+                return res.status(403).send({ message: "Forbidden access: No verified user email" })
+            }
+            const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
+            if (user?.role !== "admin") {
+                return res.status(403).send({ message: "Forbidden access: Admin access required" })
+            }
             next()
         }
 
         // Strict Admin Only middleware for critical operations (e.g. Delete Category)
         const verifyAdminOnly = async (req, res, next) => {
-            const email = req.decodedEmail || req.headers['x-user-email']
-            if (email) {
-                const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
-                if (user && user.role !== "admin") {
-                    return res.status(403).send({ message: "Forbidden: Only Admin can delete categories." })
-                }
+            const email = req.decodedEmail
+            if (!email) {
+                return res.status(403).send({ message: "Forbidden: No verified user email" })
+            }
+            const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
+            if (user?.role !== "admin") {
+                return res.status(403).send({ message: "Forbidden: Only Admin can perform this action." })
             }
             next()
         }
 
         // Strict Admin or Manager middleware for room maintenance operations (Out of Order)
         const verifyAdminOrManager = async (req, res, next) => {
-            const email = req.decodedEmail || req.headers['x-user-email'] || req.body?.createdBy?.email || req.body?.resolvedBy?.email
-            const roleInBody = String(req.body?.createdBy?.role || req.body?.resolvedBy?.role || '').trim().toLowerCase()
-
-            if (email) {
-                const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
-                const role = String(user?.role || roleInBody || '').trim().toLowerCase()
-                if (role && !["admin", "manager"].includes(role)) {
-                    return res.status(403).send({ message: "Forbidden: Only Admin or Manager can modify Out of Order status." })
-                }
-            } else if (roleInBody && !["admin", "manager"].includes(roleInBody)) {
+            const email = req.decodedEmail
+            if (!email) {
+                return res.status(403).send({ message: "Forbidden: No verified user email" })
+            }
+            const user = await userCollection.findOne({ email: { $regex: `^${email}$`, $options: "i" } })
+            const role = String(user?.role || '').trim().toLowerCase()
+            if (!["admin", "manager"].includes(role)) {
                 return res.status(403).send({ message: "Forbidden: Only Admin or Manager can modify Out of Order status." })
             }
             next()
@@ -841,28 +901,20 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
         app.delete("/room/:id", async (req, res) => {
             const { id } = req.params
-            const query = { _id: new ObjectId(id) }
+            const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
             // get the room to find all cloudinary public_ids before deleting
             const room = await roomCollection.findOne(query)
 
-            // Delete all images associated with this room
-            const publicIdsToDelete = []
-            if (room?.imagePublicId) publicIdsToDelete.push(room.imagePublicId)
-            if (Array.isArray(room?.images)) {
-                room.images.forEach(img => {
-                    if (img?.publicId && !publicIdsToDelete.includes(img.publicId)) {
-                        publicIdsToDelete.push(img.publicId)
+            if (room) {
+                const publicIdsToDelete = collectCloudinaryPublicIds(room)
+                await Promise.all(publicIdsToDelete.map(async (pId) => {
+                    try {
+                        await cloudinary.uploader.destroy(pId)
+                    } catch (err) {
+                        console.log("Cloudinary delete error for room image", pId, ":", err.message)
                     }
-                })
+                }))
             }
-
-            await Promise.all(publicIdsToDelete.map(async (pId) => {
-                try {
-                    await cloudinary.uploader.destroy(pId)
-                } catch (err) {
-                    console.log("Cloudinary delete error for", pId, ":", err.message)
-                }
-            }))
 
             const result = await roomCollection.deleteOne(query)
             res.send(result)
@@ -1110,7 +1162,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             return res.status(400).send({ message: "Payment Method is required for confirmed bookings with payment." })
                         }
 
-                        const isDigitalMethod = !["Cash", "Other"].includes(String(data.paymentMethod).trim())
+                        const isDigitalMethod = isDigitalPaymentMethod(data.paymentMethod)
                         if (isDigitalMethod && (!data.transactionId || !String(data.transactionId).trim())) {
                             return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${data.paymentMethod}.` })
                         }
@@ -1305,70 +1357,163 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
 
         app.get("/bookings", verifyFBToken, async (req, res) => {
-            const { email, status, reference, search, skip, limit } = req.query
-            let query = {}
-            let sort = { _id: -1 }
-            if (email) {
-                const emailRegex = { $regex: `^${email}$`, $options: "i" }
-                const emailFilters = [
-                    { userEmail: emailRegex },
-                    { "bookedBy.email": emailRegex },
-                    { "createdBy.email": emailRegex }
-                ]
-                query.$or = emailFilters
-            }
-            if (reference) {
-                const refFilters = [
-                    { reference: { $regex: reference, $options: "i" } },
-                    { "bookedBy.name": { $regex: reference, $options: "i" } },
-                    { "bookedBy.email": { $regex: reference, $options: "i" } },
-                    { "createdBy.name": { $regex: reference, $options: "i" } }
-                ]
-                if (query.$or) {
-                    query.$and = [{ $or: query.$or }, { $or: refFilters }]
-                    delete query.$or
-                } else {
-                    query.$or = refFilters
+            try {
+                const { email, status, reference, search, skip, limit } = req.query
+                const isPaginated = skip !== undefined || limit !== undefined
+                const parsedLimit = limit !== undefined ? Math.max(1, parseInt(limit, 10) || 25) : 0
+                const parsedSkip = skip !== undefined ? Math.max(0, parseInt(skip, 10) || 0) : 0
+
+                const andConditions = []
+
+                if (email) {
+                    const escEmail = String(email).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    const emailRegex = { $regex: `^${escEmail}$`, $options: "i" }
+                    andConditions.push({
+                        $or: [
+                            { userEmail: emailRegex },
+                            { "bookedBy.email": emailRegex },
+                            { "createdBy.email": emailRegex }
+                        ]
+                    })
                 }
-            }
-            if (status) {
-                if (Array.isArray(status)) {
-                    query.status = { $in: status }
-                } else {
-                    query.status = status
+
+                if (reference) {
+                    const escRef = String(reference).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    const refRegex = { $regex: escRef, $options: "i" }
+                    andConditions.push({
+                        $or: [
+                            { reference: refRegex },
+                            { "bookedBy.name": refRegex },
+                            { "bookedBy.email": refRegex },
+                            { "createdBy.name": refRegex }
+                        ]
+                    })
                 }
-            }
-            if (search) {
-                const sRegex = { $regex: search, $options: "i" }
-                const searchFilters = [
-                    { name: sRegex },
-                    { mobile: sRegex },
-                    { bookingId: sRegex },
-                    { reference: sRegex },
-                    { address: sRegex },
-                    { "bookedBy.name": sRegex },
-                    { "bookedBy.email": sRegex }
-                ]
-                if (query.$or) {
-                    query.$and = [{ $or: query.$or }, { $or: searchFilters }]
-                    delete query.$or
-                } else {
-                    query.$or = searchFilters
+
+                if (status) {
+                    if (Array.isArray(status)) {
+                        andConditions.push({ status: { $in: status } })
+                    } else if (status === "cancel" || status === "cancelled") {
+                        andConditions.push({ status: { $in: CANCEL_STATUSES } })
+                    } else if (status === "checked_id" || status === "checked_in") {
+                        andConditions.push({ status: { $in: ["checked_id", "checked_in"] } })
+                    } else if (status === "booking_confirmed" || status === "confirmed") {
+                        andConditions.push({ status: { $in: ["booking_confirmed", "confirmed"] } })
+                    } else {
+                        andConditions.push({ status })
+                    }
                 }
+
+                if (search && String(search).trim()) {
+                    const escSearch = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    const sRegex = { $regex: escSearch, $options: "i" }
+                    andConditions.push({
+                        $or: [
+                            { name: sRegex },
+                            { mobile: sRegex },
+                            { bookingId: sRegex },
+                            { reference: sRegex },
+                            { address: sRegex },
+                            { userEmail: sRegex },
+                            { "bookedBy.name": sRegex },
+                            { "bookedBy.email": sRegex },
+                            { "rooms.categoryName": sRegex },
+                            { "rooms.roomNo": sRegex },
+                            { roomName: sRegex },
+                            { roomCategory: sRegex }
+                        ]
+                    })
+                }
+
+                const query = andConditions.length > 0 ? { $and: andConditions } : {}
+                const sort = { _id: -1 }
+
+                const bookingListProjection = {
+                    _id: 1,
+                    bookingId: 1,
+                    name: 1,
+                    mobile: 1,
+                    address: 1,
+                    userEmail: 1,
+                    rooms: 1,
+                    totalAmount: 1,
+                    discountAmount: 1,
+                    paidAmount: 1,
+                    dueAmount: 1,
+                    paymentMethod: 1,
+                    extraService: 1,
+                    extraServiceCost: 1,
+                    extraServices: 1,
+                    reference: 1,
+                    bookedBy: 1,
+                    createdBy: 1,
+                    changedBy: 1,
+                    transactionId: 1,
+                    notes: 1,
+                    guestType: 1,
+                    checkIn: 1,
+                    checkOut: 1,
+                    roomName: 1,
+                    roomCategory: 1,
+                    createdAt: 1,
+                    requestedByRole: 1,
+                    status: 1,
+                    cancelledAt: 1,
+                    cancelledBy: 1,
+                    cancelReason: 1,
+                    refundAmount: 1,
+                    advanceAmount: 1,
+                    updatedAt: 1
+                }
+
+                if (isPaginated) {
+                    const pipeline = [
+                        { $match: query },
+                        { $sort: sort },
+                        {
+                            $facet: {
+                                paginatedResults: [
+                                    { $skip: parsedSkip },
+                                    { $limit: parsedLimit || 25 },
+                                    { $project: bookingListProjection }
+                                ],
+                                totalCount: [
+                                    { $count: "count" }
+                                ]
+                            }
+                        }
+                    ]
+                    const [facetResult] = await bookingCollection.aggregate(pipeline).toArray()
+                    const rawBookings = facetResult?.paginatedResults || []
+                    const totalDataCount = facetResult?.totalCount?.[0]?.count || 0
+                    const result = await hydrateBookingsWithRooms(rawBookings, roomCollection, categoryAndRoomCollection)
+                    return res.send({ result, totalDataCount })
+                }
+
+                const bookings = await bookingCollection
+                    .find(query)
+                    .sort(sort)
+                    .project(bookingListProjection)
+                    .toArray()
+                const result = await hydrateBookingsWithRooms(bookings, roomCollection, categoryAndRoomCollection)
+                res.send(result)
+            } catch (err) {
+                console.error("GET /bookings error:", err)
+                res.status(500).send({ message: "Failed to fetch reservations." })
             }
-            const bookings = await bookingCollection
-                .find(query)
-                .sort(sort)
-                .skip(Number(skip) || 0)
-                .limit(Number(limit) || 0)
-                .toArray()
-            const result = await hydrateBookingsWithRooms(bookings, roomCollection, categoryAndRoomCollection)
-            if (skip || limit) {
-                const totalDataCount = await bookingCollection.countDocuments(query)
-                res.send({ result, totalDataCount })
-                return
+        })
+
+        app.get("/bookings/references", verifyFBToken, async (req, res) => {
+            try {
+                const refs = await bookingCollection.distinct("reference")
+                const staffNames = await bookingCollection.distinct("bookedBy.name")
+                const combined = Array.from(new Set([...refs, ...staffNames].filter(r => r && typeof r === 'string' && r.trim())))
+                combined.sort((a, b) => a.localeCompare(b))
+                res.send(combined)
+            } catch (err) {
+                console.error("GET /bookings/references error:", err)
+                res.status(500).send({ message: "Failed to fetch references." })
             }
-            res.send(result)
         })
 
         app.get("/booking/:id", verifyFBToken, async (req, res) => {
@@ -1877,14 +2022,14 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             return res.status(400).send({ message: "Payment Method is required for confirmed bookings with payment." })
                         }
 
-                        const isDigitalMethod = !["Cash", "Other"].includes(String(effectiveMethod).trim())
+                        const isDigitalMethod = isDigitalPaymentMethod(effectiveMethod)
                         const effectiveTrx = updateData.transactionId !== undefined ? updateData.transactionId : (currentDoc?.transactionId || "")
                         if (isDigitalMethod && (!effectiveTrx || !String(effectiveTrx).trim())) {
                             return res.status(400).send({ message: `Transaction ID / Receipt No is required for ${effectiveMethod}.` })
                         }
                     }
 
-                    const effectiveRef = updateData.reference !== undefined ? updateData.reference : (currentDoc?.reference || "")
+                    const effectiveRef = updateData.reference !== undefined ? updateData.reference : (currentDoc?.reference || updateData.changedBy?.name || "")
                     if (!effectiveRef || !String(effectiveRef).trim()) {
                         return res.status(400).send({ message: "Staff / Admin Reference is required for confirmed bookings." })
                     }
@@ -2003,7 +2148,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
 
         // Dedicated Reservation Voucher / Printable Invoice Data API
-        app.get("/booking/:id/reservation-voucher", async (req, res) => {
+        app.get("/booking/:id/reservation-voucher", verifyFBToken, async (req, res) => {
             try {
                 const { id } = req.params
                 const objectId = toObjectId(id)
@@ -2130,7 +2275,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
 
         // Add due payment to a booking
-        app.post("/booking/:id/add-payment", async (req, res) => {
+        app.post("/booking/:id/add-payment", verifyFBToken, async (req, res) => {
             try {
                 const { id } = req.params
                 const { amount, paymentMethod, reference, transactionId, note, collectedBy } = req.body
@@ -2214,7 +2359,11 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
                             statusHistory: statusAuditEntry,
                             editHistory: editAuditEntry
                         },
-                        $set: { updatedAt: now }
+                        $set: {
+                            updatedAt: now,
+                            ...(paymentMethod ? { paymentMethod } : {}),
+                            ...(transactionId ? { transactionId } : {})
+                        }
                     },
                     { returnDocument: "after" }
                 )
@@ -2512,17 +2661,42 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             res.send(result)
         })
 
-        app.patch("/categoryandroom/:id", async (req, res) => {
+        app.patch("/categoryandroom/:id", verifyFBToken, verifyAdmin, async (req, res) => {
             const { id } = req.params
             const data = req.body
+            const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
+
+            // If updating images, delete any removed images from Cloudinary
+            if (data.images !== undefined || data.imageUrl !== undefined || data.imagePublicId !== undefined) {
+                try {
+                    const existingCat = await categoryAndRoomCollection.findOne(query)
+                    if (existingCat) {
+                        const oldIds = collectCloudinaryPublicIds(existingCat)
+                        const newIds = new Set(collectCloudinaryPublicIds(data))
+                        const removedIds = oldIds.filter(pId => !newIds.has(pId))
+
+                        if (removedIds.length > 0) {
+                            await Promise.all(removedIds.map(async (pId) => {
+                                try {
+                                    await cloudinary.uploader.destroy(pId)
+                                } catch (err) {
+                                    console.log("Cloudinary delete error for removed category image", pId, ":", err.message)
+                                }
+                            }))
+                        }
+                    }
+                } catch (e) {
+                    console.log("Error cleaning up removed category images:", e.message)
+                }
+            }
+
             data.updatedAt = new Date()
-            const query = { _id: new ObjectId(id) }
             const update = { $set: data }
             const result = await categoryAndRoomCollection.updateOne(query, update)
             res.send(result)
         })
 
-        app.post("/categoryandroom", async (req, res) => {
+        app.post("/categoryandroom", verifyFBToken, verifyAdmin, async (req, res) => {
             const data = req.body
             data.createdAt = new Date()
             data.updatedAt = new Date()
@@ -2606,29 +2780,21 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 
         app.delete('/categoryandroom/:id', verifyFBToken, verifyAdminOnly, async (req, res) => {
             const { id } = req.params
-            const query = { _id: new ObjectId(id) }
+            const query = toObjectId(id) ? { _id: toObjectId(id) } : { _id: id }
 
-            // Get the category first to find Cloudinary images to delete
+            // Get the category first to find all Cloudinary images to delete
             const category = await categoryAndRoomCollection.findOne(query)
 
-            // Collect all public IDs to delete from Cloudinary
-            const publicIdsToDelete = []
-            if (category?.imagePublicId) publicIdsToDelete.push(category.imagePublicId)
-            if (Array.isArray(category?.images)) {
-                category.images.forEach(img => {
-                    if (img?.publicId && !publicIdsToDelete.includes(img.publicId)) {
-                        publicIdsToDelete.push(img.publicId)
+            if (category) {
+                const publicIdsToDelete = collectCloudinaryPublicIds(category)
+                await Promise.all(publicIdsToDelete.map(async (pId) => {
+                    try {
+                        await cloudinary.uploader.destroy(pId)
+                    } catch (err) {
+                        console.log("Cloudinary delete error for category image", pId, ":", err.message)
                     }
-                })
+                }))
             }
-
-            await Promise.all(publicIdsToDelete.map(async (pId) => {
-                try {
-                    await cloudinary.uploader.destroy(pId)
-                } catch (err) {
-                    console.log("Cloudinary delete error for", pId, ":", err.message)
-                }
-            }))
 
             const result = await categoryAndRoomCollection.deleteOne(query)
             res.send(result)
@@ -2644,7 +2810,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.post("/extra-services", async (req, res) => {
+        app.post("/extra-services", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const service = {
                     name: req.body.name,
@@ -2664,7 +2830,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.patch("/extra-services/:id", async (req, res) => {
+        app.patch("/extra-services/:id", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params
                 const query = toObjectId(id) ? { $or: [{ _id: toObjectId(id) }, { _id: id }] } : { _id: id }
@@ -2682,7 +2848,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.delete("/extra-services/:id", async (req, res) => {
+        app.delete("/extra-services/:id", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params
                 const query = toObjectId(id) ? { $or: [{ _id: toObjectId(id) }, { _id: id }] } : { _id: id }
@@ -2734,7 +2900,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.post("/settings/extra-services/billing-types", async (req, res) => {
+        app.post("/settings/extra-services/billing-types", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { name, unitLabel, description } = req.body || {}
                 const cleanName = String(name || "").trim()
@@ -2776,7 +2942,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.patch("/settings/extra-services/billing-types/:id", async (req, res) => {
+        app.patch("/settings/extra-services/billing-types/:id", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params
                 const { name, unitLabel, description } = req.body || {}
@@ -2844,7 +3010,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             }
         })
 
-        app.delete("/settings/extra-services/billing-types/:id", async (req, res) => {
+        app.delete("/settings/extra-services/billing-types/:id", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params
                 const currentTypes = await getOrSeedBillingTypes()
@@ -2982,125 +3148,430 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
             res.send(result)
         })
 
-        // Detailed Income Analytics
+        // Detailed Income Analytics (Supports Server-Side Pagination with limit & skip, powered by MongoDB Aggregation)
         app.get("/admin/income-breakdown", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
-                const { startDate, endDate } = req.query
-                const allBookings = await bookingCollection.find().sort({ _id: -1 }).toArray()
-                const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection, categoryAndRoomCollection)
-                
-                let revenueBookings = hydratedBookings.filter(isRevenueBooking)
+                const {
+                    startDate,
+                    endDate,
+                    limit: reqLimit,
+                    skip: reqSkip,
+                    search,
+                    category,
+                    role,
+                    worker,
+                    guestType,
+                    room,
+                    bookingStatus,
+                    export: reqExport
+                } = req.query
 
-                if (startDate || endDate) {
-                    revenueBookings = revenueBookings.filter(booking => {
-                        const isCancelled = CANCEL_STATUSES.includes(booking.status)
-                        const cancelDate = booking.cancelledAt ? String(booking.cancelledAt).slice(0, 10) : ""
+                const isExport = reqExport === "true" || reqExport === true
+                const limit = reqLimit !== undefined ? Math.max(1, parseInt(reqLimit, 10) || 25) : 25
+                const skip = reqSkip !== undefined ? Math.max(0, parseInt(reqSkip, 10) || 0) : 0
 
-                        if (isCancelled && cancelDate) {
-                            if (startDate && endDate) {
-                                if (cancelDate >= startDate && cancelDate <= endDate) return true
-                            } else if (startDate && cancelDate >= startDate) {
-                                return true
-                            } else if (endDate && cancelDate <= endDate) {
-                                return true
-                            }
-                        }
-
-                        const rooms = getBookingRooms(booking)
-                        return rooms.some(r => {
-                            const cIn = r.checkIn ? String(r.checkIn).slice(0, 10) : ""
-                            const cOut = r.checkOut ? String(r.checkOut).slice(0, 10) : ""
-                            if (startDate && endDate) {
-                                return (cIn <= endDate && cOut >= startDate)
-                            } else if (startDate) {
-                                return cOut >= startDate
-                            } else if (endDate) {
-                                return cIn <= endDate
-                            }
-                            return true
-                        })
-                    })
+                // 1. Initial Status Filter
+                let statusMatch = {}
+                if (bookingStatus && bookingStatus !== "all") {
+                    if (bookingStatus === "confirmed") {
+                        statusMatch = { status: { $in: ["booking_confirmed", "confirmed"] } }
+                    } else if (bookingStatus === "checked_in") {
+                        statusMatch = { status: { $in: ["checked_in", "checked_id"] } }
+                    } else if (bookingStatus === "checked_out") {
+                        statusMatch = { status: "checked_out" }
+                    } else if (bookingStatus === "cancelled") {
+                        statusMatch = { status: { $in: CANCEL_STATUSES }, paidAmount: { $gt: 0 } }
+                    } else if (bookingStatus === "request_booking") {
+                        statusMatch = { status: "request_booking" }
+                    }
+                } else {
+                    statusMatch = {
+                        $or: [
+                            { status: { $in: CONFIRMED_STATUSES } },
+                            { status: { $in: CANCEL_STATUSES }, paidAmount: { $gt: 0 } }
+                        ]
+                    }
                 }
 
-                const roomStats = {}
-                revenueBookings.forEach(booking => {
-                    const isCancelled = CANCEL_STATUSES.includes(booking.status)
-                    const rooms = getBookingRooms(booking)
-                    const retainedPaid = Number(booking.paidAmount || 0)
-                    const totalRoomPrice = rooms.reduce((sum, r) => sum + (getRoomTotal(r) || 1), 0) || 1
+                const initialMatch = { ...statusMatch }
 
-                    rooms.forEach(room => {
-                        const cIn = room.checkIn ? String(room.checkIn).slice(0, 10) : ""
-                        const cOut = room.checkOut ? String(room.checkOut).slice(0, 10) : ""
-                        
-                        if (startDate && endDate) {
-                            if (!(cIn <= endDate && cOut >= startDate)) return
-                        } else if (startDate) {
-                            if (!(cOut >= startDate)) return
-                        } else if (endDate) {
-                            if (!(cIn <= endDate)) return
+                // Early pre-filters before unwinding to reduce document count
+                if (category && category !== "all") {
+                    initialMatch["rooms.categoryName"] = category
+                }
+                if (room && room !== "all") {
+                    initialMatch["rooms.roomNo"] = String(room).trim()
+                }
+                if (role && role !== "all") {
+                    const roleRegex = new RegExp(`^${role}$`, 'i')
+                    initialMatch.$or = [
+                        { requestedByRole: { $regex: roleRegex } },
+                        { "bookedBy.role": { $regex: roleRegex } },
+                        { "createdBy.role": { $regex: roleRegex } },
+                        { "changedBy.role": { $regex: roleRegex } }
+                    ]
+                }
+                if (worker && worker !== "all") {
+                    const wRegex = new RegExp(`^${worker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i')
+                    initialMatch.$or = [
+                        { reference: { $regex: wRegex } },
+                        { "bookedBy.name": { $regex: wRegex } },
+                        { "bookedBy.email": { $regex: wRegex } },
+                        { "createdBy.name": { $regex: wRegex } },
+                        { "createdBy.email": { $regex: wRegex } },
+                        { "changedBy.name": { $regex: wRegex } },
+                        { "changedBy.email": { $regex: wRegex } }
+                    ]
+                }
+
+                const pipeline = [
+                    { $match: initialMatch },
+                    // Stage 2: Lean Projection (strip large history arrays)
+                    {
+                        $project: {
+                            bookingId: 1,
+                            name: 1,
+                            mobile: 1,
+                            rooms: 1,
+                            totalAmount: 1,
+                            paidAmount: 1,
+                            dueAmount: 1,
+                            discountAmount: 1,
+                            extraService: 1,
+                            extraServiceCost: 1,
+                            reference: 1,
+                            bookedBy: 1,
+                            createdBy: 1,
+                            changedBy: 1,
+                            transactionId: 1,
+                            paymentMethod: 1,
+                            guestType: 1,
+                            requestedByRole: 1,
+                            status: 1,
+                            createdAt: 1,
+                            cancelledAt: 1,
+                            cancelReason: 1,
+                            refundAmount: 1
                         }
-
-                        const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
-                        if (!roomStats[label]) {
-                            roomStats[label] = {
-                                roomName: label,
-                                totalRevenue: 0,
-                                bookingCount: 0,
-                                totalNights: 0,
-                                bookings: []
+                    },
+                    // Stage 3: Compute totalRoomPrice on booking before unwinding
+                    {
+                        $addFields: {
+                            totalRoomPrice: {
+                                $sum: {
+                                    $map: {
+                                        input: { $ifNull: ["$rooms", []] },
+                                        as: "r",
+                                        in: {
+                                            $multiply: [
+                                                { $ifNull: ["$$r.nights", 1] },
+                                                { $ifNull: ["$$r.pricePerNight", 0] }
+                                            ]
+                                        }
+                                    }
+                                }
                             }
                         }
-                        const nights = getNightCount(room.checkIn, room.checkOut)
-                        const extraCost = Number(booking.extraServiceCost || 0)
-                        const discount = Number(booking.discountAmount || 0)
-                        const roomRatio = (getRoomTotal(room) || 1) / totalRoomPrice
-                        const rTotal = isCancelled
-                            ? (roomRatio * retainedPaid)
-                            : Math.max(0, getRoomTotal(room) + (roomRatio * (extraCost - discount)))
+                    },
+                    // Stage 4: Unwind rooms
+                    { $unwind: "$rooms" }
+                ]
 
-                        roomStats[label].totalRevenue += rTotal
-                        roomStats[label].bookingCount += 1
-                        roomStats[label].totalNights += nights
-                        roomStats[label].bookings.push({
-                            bookingId: booking.bookingId,
-                            _id: booking._id,
-                            guestName: booking.name,
-                            guestPhone: booking.mobile,
-                            roomNo: room.roomNo || "",
-                            checkIn: room.checkIn,
-                            checkOut: room.checkOut,
-                            nights,
-                            adults: Number(room.adults !== undefined ? room.adults : (booking.adults || 1)),
-                            children: Number(room.children !== undefined ? room.children : (room.babies !== undefined ? room.babies : (booking.children || booking.babies || 0))),
-                            amount: rTotal,
-                            reference: booking.reference || "",
-                            transactionId: booking.transactionId || "",
-                            paymentMethod: booking.paymentMethod || "",
-                            paidAmount: isCancelled ? retainedPaid : Number(booking.paidAmount || 0),
-                            dueAmount: isCancelled ? 0 : Number(booking.dueAmount || 0),
-                            extraService: booking.extraService || "",
-                            extraServiceCost: Number(booking.extraServiceCost || 0),
-                            requestedByRole: booking.requestedByRole || booking.changedBy?.role || "",
-                            guestType: booking.guestType || ((booking.requestedByRole === "user" || !booking.requestedByRole || String(booking.reference || "").toLowerCase().includes("website")) ? "WEB" : "Walk-In"),
-                            bookedBy: booking.bookedBy || booking.createdBy || booking.changedBy || null,
-                            status: booking.status,
-                            createdAt: booking.createdAt,
-                            cancelReason: booking.cancelReason || "",
-                            refundAmount: Number(booking.refundAmount || 0)
-                        })
-                    })
+                // Stage 5: Date filter on unwound room
+                if (startDate || endDate) {
+                    let dateCondition = {}
+                    if (startDate && endDate) {
+                        dateCondition = {
+                            $or: [
+                                {
+                                    status: { $in: CANCEL_STATUSES },
+                                    cancelledAt: { $exists: true, $ne: null },
+                                    $expr: {
+                                        $and: [
+                                            { $gte: [{ $substrCP: [{ $toString: "$cancelledAt" }, 0, 10] }, startDate] },
+                                            { $lte: [{ $substrCP: [{ $toString: "$cancelledAt" }, 0, 10] }, endDate] }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "rooms.checkIn": { $lte: endDate },
+                                    "rooms.checkOut": { $gte: startDate }
+                                }
+                            ]
+                        }
+                    } else if (startDate) {
+                        dateCondition = {
+                            $or: [
+                                {
+                                    status: { $in: CANCEL_STATUSES },
+                                    cancelledAt: { $exists: true, $ne: null },
+                                    $expr: { $gte: [{ $substrCP: [{ $toString: "$cancelledAt" }, 0, 10] }, startDate] }
+                                },
+                                { "rooms.checkOut": { $gte: startDate } }
+                            ]
+                        }
+                    } else if (endDate) {
+                        dateCondition = {
+                            $or: [
+                                {
+                                    status: { $in: CANCEL_STATUSES },
+                                    cancelledAt: { $exists: true, $ne: null },
+                                    $expr: { $lte: [{ $substrCP: [{ $toString: "$cancelledAt" }, 0, 10] }, endDate] }
+                                },
+                                { "rooms.checkIn": { $lte: endDate } }
+                            ]
+                        }
+                    }
+                    pipeline.push({ $match: dateCondition })
+                }
+
+                // Stage 6: Room calculations & amounts normalization
+                pipeline.push(
+                    {
+                        $addFields: {
+                            categoryName: { $ifNull: ["$rooms.categoryName", "Room"] },
+                            roomNo: { $ifNull: ["$rooms.roomNo", ""] },
+                            nights: { $ifNull: ["$rooms.nights", 1] },
+                            roomBase: {
+                                $multiply: [
+                                    { $ifNull: ["$rooms.nights", 1] },
+                                    { $ifNull: ["$rooms.pricePerNight", 0] }
+                                ]
+                            },
+                            computedGuestType: {
+                                $cond: [
+                                    { $and: [{ $ne: [{ $ifNull: ["$guestType", ""] }, ""] }, { $ne: ["$guestType", null] }] },
+                                    "$guestType",
+                                    {
+                                        $cond: [
+                                            {
+                                                $or: [
+                                                    { $eq: ["$requestedByRole", "user"] },
+                                                    { $eq: [{ $ifNull: ["$requestedByRole", ""] }, ""] }
+                                                ]
+                                            },
+                                            "WEB",
+                                            "Walk-In"
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            roomRatio: {
+                                $cond: [
+                                    { $gt: ["$totalRoomPrice", 0] },
+                                    { $divide: ["$roomBase", "$totalRoomPrice"] },
+                                    1
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            amount: {
+                                $cond: [
+                                    { $in: ["$status", CANCEL_STATUSES] },
+                                    { $multiply: ["$roomRatio", { $ifNull: ["$paidAmount", 0] }] },
+                                    {
+                                        $max: [
+                                            0,
+                                            {
+                                                $add: [
+                                                    "$roomBase",
+                                                    {
+                                                        $multiply: [
+                                                            "$roomRatio",
+                                                            {
+                                                                $subtract: [
+                                                                    { $ifNull: ["$extraServiceCost", 0] },
+                                                                    { $ifNull: ["$discountAmount", 0] }
+                                                                ]
+                                                            }
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            displayPaidAmount: {
+                                $cond: [
+                                    { $in: ["$status", CANCEL_STATUSES] },
+                                    { $ifNull: ["$paidAmount", 0] },
+                                    { $ifNull: ["$paidAmount", 0] }
+                                ]
+                            },
+                            displayDueAmount: {
+                                $cond: [
+                                    { $in: ["$status", CANCEL_STATUSES] },
+                                    0,
+                                    { $ifNull: ["$dueAmount", 0] }
+                                ]
+                            }
+                        }
+                    }
+                )
+
+                // Stage 7: Post-unwind filters for category, room, guestType, search
+                const postMatch = {}
+                if (category && category !== "all") {
+                    postMatch.categoryName = category
+                }
+                if (room && room !== "all") {
+                    postMatch.roomNo = String(room).trim()
+                }
+                if (guestType && guestType !== "all") {
+                    postMatch.computedGuestType = guestType
+                }
+                if (search && search.trim()) {
+                    const s = search.trim()
+                    const sRegex = new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+                    postMatch.$or = [
+                        { name: { $regex: sRegex } },
+                        { mobile: { $regex: sRegex } },
+                        { bookingId: { $regex: sRegex } },
+                        { categoryName: { $regex: sRegex } },
+                        { roomNo: { $regex: sRegex } },
+                        { transactionId: { $regex: sRegex } },
+                        { reference: { $regex: sRegex } },
+                        { paymentMethod: { $regex: sRegex } }
+                    ]
+                }
+                if (Object.keys(postMatch).length > 0) {
+                    pipeline.push({ $match: postMatch })
+                }
+
+                // Table row projection
+                const rowProjection = {
+                    _id: 1,
+                    bookingId: 1,
+                    guestName: "$name",
+                    guestPhone: "$mobile",
+                    categoryName: 1,
+                    roomNo: 1,
+                    checkIn: "$rooms.checkIn",
+                    checkOut: "$rooms.checkOut",
+                    nights: 1,
+                    adults: { $ifNull: ["$rooms.adults", 1] },
+                    children: { $ifNull: ["$rooms.children", { $ifNull: ["$rooms.babies", 0] }] },
+                    amount: 1,
+                    reference: { $ifNull: ["$reference", ""] },
+                    transactionId: { $ifNull: ["$transactionId", ""] },
+                    paymentMethod: { $ifNull: ["$paymentMethod", ""] },
+                    paidAmount: "$displayPaidAmount",
+                    dueAmount: "$displayDueAmount",
+                    extraService: { $ifNull: ["$extraService", ""] },
+                    extraServiceCost: { $ifNull: ["$extraServiceCost", 0] },
+                    requestedByRole: { $ifNull: ["$requestedByRole", ""] },
+                    guestType: "$computedGuestType",
+                    bookedBy: { $ifNull: ["$bookedBy", { $ifNull: ["$createdBy", "$changedBy"] }] },
+                    status: 1,
+                    createdAt: 1,
+                    cancelReason: { $ifNull: ["$cancelReason", ""] },
+                    refundAmount: { $ifNull: ["$refundAmount", 0] }
+                }
+
+                const paginatedStages = [
+                    { $sort: { _id: -1 } }
+                ]
+
+                if (!isExport) {
+                    paginatedStages.push({ $skip: skip })
+                    paginatedStages.push({ $limit: limit })
+                }
+                paginatedStages.push({ $project: rowProjection })
+
+                // Stage 8: Facet
+                pipeline.push({
+                    $facet: {
+                        paginatedResults: paginatedStages,
+                        roomItemSummary: [
+                            {
+                                $group: {
+                                    _id: null,
+                                    totalDataCount: { $sum: 1 },
+                                    totalRevenue: { $sum: "$amount" },
+                                    totalNights: { $sum: "$nights" }
+                                }
+                            }
+                        ],
+                        distinctBookingSummary: [
+                            {
+                                $group: {
+                                    _id: "$_id",
+                                    paidAmount: { $first: "$displayPaidAmount" },
+                                    dueAmount: { $first: "$displayDueAmount" }
+                                }
+                            },
+                            {
+                                $group: {
+                                    _id: null,
+                                    distinctBookingsCount: { $sum: 1 },
+                                    totalPaid: { $sum: "$paidAmount" },
+                                    totalDue: { $sum: "$dueAmount" }
+                                }
+                            }
+                        ],
+                        roomBreakdown: [
+                            {
+                                $group: {
+                                    _id: "$categoryName",
+                                    totalRevenue: { $sum: "$amount" },
+                                    bookingCount: { $sum: 1 },
+                                    totalNights: { $sum: "$nights" }
+                                }
+                            },
+                            { $sort: { totalRevenue: -1 } },
+                            {
+                                $project: {
+                                    _id: 0,
+                                    roomName: "$_id",
+                                    totalRevenue: 1,
+                                    bookingCount: 1,
+                                    totalNights: 1
+                                }
+                            }
+                        ]
+                    }
                 })
 
-                const totalRevenue = revenueBookings.reduce((sum, b) => sum + getBookingRevenue(b), 0)
+                const aggregationResult = (await bookingCollection.aggregate(pipeline).toArray())[0] || {}
+
+                const paginatedResult = aggregationResult.paginatedResults || []
+                const itemSummary = aggregationResult.roomItemSummary?.[0] || {}
+                const bookingSummary = aggregationResult.distinctBookingSummary?.[0] || {}
+                const roomBreakdown = aggregationResult.roomBreakdown || []
+
+                const totalDataCount = Number(itemSummary.totalDataCount || 0)
+                const totalRevenue = Math.round(Number(itemSummary.totalRevenue || 0))
+                const totalPaid = Math.round(Number(bookingSummary.totalPaid || 0))
+                const totalDue = Math.round(Number(bookingSummary.totalDue || 0))
+                const totalNights = Number(itemSummary.totalNights || 0)
+                const distinctBookingsCount = Number(bookingSummary.distinctBookingsCount || 0)
 
                 res.send({
+                    result: paginatedResult,
+                    totalDataCount,
                     totalRevenue,
-                    totalConfirmedBookings: revenueBookings.length,
-                    roomBreakdown: Object.values(roomStats).sort((a, b) => b.totalRevenue - a.totalRevenue),
+                    totalConfirmedBookings: distinctBookingsCount,
+                    summary: {
+                        totalRevenue,
+                        totalPaid,
+                        totalDue,
+                        totalNights,
+                        distinctBookingsCount
+                    },
+                    roomBreakdown,
+                    limit: isExport ? totalDataCount : limit,
+                    skip: isExport ? 0 : skip,
                     filter: {
                         startDate: startDate || null,
-                        endDate: endDate || null
+                        endDate: endDate || null,
+                        search: search || null
                     }
                 })
             } catch (err) {
@@ -3110,7 +3581,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
 
         // Staff / Agent / Manager Role Sells Overview & Detailed Breakdown
-        app.get("/sales/my-overview", async (req, res) => {
+        app.get("/sales/my-overview", verifyFBToken, async (req, res) => {
             try {
                 const { email, name, role } = req.query
                 const now = new Date()
@@ -3222,7 +3693,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
 
         // Schedule Price Change for Category
-        app.post("/categoryandroom/:id/schedule-price", async (req, res) => {
+        app.post("/categoryandroom/:id/schedule-price", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params
                 const { effectiveDate, price, note } = req.body
@@ -3309,7 +3780,7 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
         })
 
         // Delete / Cancel Scheduled Price (only removes from scheduledPrices, never history)
-        app.delete("/categoryandroom/:id/schedule-price/:effectiveDate", async (req, res) => {
+        app.delete("/categoryandroom/:id/schedule-price/:effectiveDate", verifyFBToken, verifyAdmin, async (req, res) => {
             try {
                 const { id, effectiveDate } = req.params
                 const catId = toObjectId(id) || id
