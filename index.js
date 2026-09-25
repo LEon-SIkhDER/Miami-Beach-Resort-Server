@@ -95,7 +95,7 @@ function getDatabase() {
         client = new MongoClient(uri, {
             serverApi: {
                 version: ServerApiVersion.v1,
-                strict: true,
+                strict: false,
                 deprecationErrors: true,
             }
         })
@@ -1409,7 +1409,42 @@ app.get("/bookings", verifyFBToken, async (req, res) => {
             })
         }
 
-        if (email) {
+        const requestingEmail = req.decodedEmail ? String(req.decodedEmail).trim().toLowerCase() : ""
+        let requestingUser = null
+        let requestingRole = ""
+        if (requestingEmail) {
+            requestingUser = await userCollection.findOne({
+                email: { $regex: `^${requestingEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: "i" }
+            })
+            requestingRole = String(requestingUser?.role || "").trim().toLowerCase()
+        }
+        const isAdminOrManager = ["admin", "manager"].includes(requestingRole)
+
+        // Agent, B2B, and general users can ONLY see their own bookings
+        if (!isAdminOrManager) {
+            const targetEmail = requestingEmail || (email ? String(email).trim().toLowerCase() : "")
+            const escEmail = targetEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            const emailRegex = { $regex: `^${escEmail}$`, $options: "i" }
+
+            const ownBookingConditions = [
+                { userEmail: emailRegex },
+                { "bookedBy.email": emailRegex },
+                { "createdBy.email": emailRegex },
+                { reference: emailRegex }
+            ]
+
+            if (requestingUser?.name && String(requestingUser.name).trim()) {
+                const escName = String(requestingUser.name).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                const nameRegex = { $regex: `^${escName}$`, $options: "i" }
+                ownBookingConditions.push(
+                    { reference: nameRegex },
+                    { "bookedBy.name": nameRegex },
+                    { "createdBy.name": nameRegex }
+                )
+            }
+
+            andConditions.push({ $or: ownBookingConditions })
+        } else if (email) {
             const escEmail = String(email).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
             const emailRegex = { $regex: `^${escEmail}$`, $options: "i" }
             andConditions.push({
@@ -1421,7 +1456,8 @@ app.get("/bookings", verifyFBToken, async (req, res) => {
             })
         }
 
-        if (reference) {
+        // Reference filter only available for Admin and Manager
+        if (reference && isAdminOrManager) {
             const escRef = String(reference).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
             const refRegex = { $regex: escRef, $options: "i" }
             andConditions.push({
@@ -1549,8 +1585,31 @@ app.get("/bookings", verifyFBToken, async (req, res) => {
 
 app.get("/bookings/references", verifyFBToken, async (req, res) => {
     try {
-        const refs = await bookingCollection.distinct("reference")
-        const staffNames = await bookingCollection.distinct("bookedBy.name")
+        const requestingEmail = req.decodedEmail ? String(req.decodedEmail).trim().toLowerCase() : ""
+        let isManagerOrAdmin = false
+        if (requestingEmail) {
+            const user = await userCollection.findOne({
+                email: { $regex: `^${requestingEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: "i" }
+            })
+            const role = String(user?.role || '').trim().toLowerCase()
+            isManagerOrAdmin = ["admin", "manager"].includes(role)
+        }
+        if (!isManagerOrAdmin) {
+            return res.send([])
+        }
+
+        const [refDocs, staffDocs] = await Promise.all([
+            bookingCollection.aggregate([
+                { $match: { reference: { $exists: true, $ne: null } } },
+                { $group: { _id: "$reference" } }
+            ]).toArray(),
+            bookingCollection.aggregate([
+                { $match: { "bookedBy.name": { $exists: true, $ne: null } } },
+                { $group: { _id: "$bookedBy.name" } }
+            ]).toArray()
+        ])
+        const refs = refDocs.map(d => d._id)
+        const staffNames = staffDocs.map(d => d._id)
         const combined = Array.from(new Set([...refs, ...staffNames].filter(r => r && typeof r === 'string' && r.trim())))
         combined.sort((a, b) => a.localeCompare(b))
         res.send(combined)
@@ -2770,42 +2829,90 @@ app.get("/check-category-availability", async (req, res) => {
         return res.send({ available: true, message: "Category has rooms available." })
     }
 
-    // For each physical room in category, check Out of Order and booking conflicts
-    let availableRoomCount = 0
-    for (const roomNo of cleanRoomNumbers) {
-        // 1. Check Out of Order maintenance
-        const isOOO = await outOfOrderCollection.findOne({
-            status: "active",
-            roomNo,
-            startDate: { $lt: checkOut },
-            endDate: { $gt: checkIn }
-        })
-        if (isOOO) continue
+    // Run two parallel aggregates instead of one DB query per room (serial loop).
+    // Both booking document shapes are handled:
+    //   - Multi-room bookings: rooms[].roomNo
+    //   - Legacy single-room bookings: root-level roomNo
+    const [oooResult, bookedResult] = await Promise.all([
+        // 1. Collect all OOO room numbers overlapping the requested date range
+        outOfOrderCollection.aggregate([
+            {
+                $match: {
+                    status: "active",
+                    roomNo: { $in: cleanRoomNumbers },
+                    startDate: { $lt: checkOut },
+                    endDate: { $gt: checkIn }
+                }
+            },
+            { $group: { _id: "$roomNo" } }
+        ]).toArray(),
 
-        // 2. Check active booking reservations
-        const isBooked = await bookingCollection.findOne({
-            status: { $in: ACTIVE_BOOKING_STATUSES },
-            $or: [
-                {
-                    rooms: {
-                        $elemMatch: {
-                            roomNo,
+        // 2. Collect all booked room numbers overlapping the requested date range.
+        //    $facet runs both booking shapes in a single collection scan.
+        bookingCollection.aggregate([
+            {
+                $match: {
+                    status: { $in: ACTIVE_BOOKING_STATUSES },
+                    $or: [
+                        // Multi-room shape: rooms array contains a matching room
+                        {
+                            rooms: {
+                                $elemMatch: {
+                                    roomNo: { $in: cleanRoomNumbers },
+                                    checkIn: { $lt: checkOut },
+                                    checkOut: { $gt: checkIn }
+                                }
+                            }
+                        },
+                        // Legacy single-room shape: roomNo at root level
+                        {
+                            roomNo: { $in: cleanRoomNumbers },
                             checkIn: { $lt: checkOut },
                             checkOut: { $gt: checkIn }
                         }
-                    }
-                },
-                {
-                    roomNo,
-                    checkIn: { $lt: checkOut },
-                    checkOut: { $gt: checkIn }
+                    ]
                 }
-            ]
-        })
-        if (isBooked) continue
+            },
+            {
+                $facet: {
+                    // Extract roomNo from multi-room bookings
+                    fromRoomsArray: [
+                        { $unwind: "$rooms" },
+                        {
+                            $match: {
+                                "rooms.roomNo": { $in: cleanRoomNumbers },
+                                "rooms.checkIn": { $lt: checkOut },
+                                "rooms.checkOut": { $gt: checkIn }
+                            }
+                        },
+                        { $group: { _id: "$rooms.roomNo" } }
+                    ],
+                    // Extract roomNo from legacy single-room bookings
+                    fromRootLevel: [
+                        {
+                            $match: {
+                                roomNo: { $in: cleanRoomNumbers },
+                                checkIn: { $lt: checkOut },
+                                checkOut: { $gt: checkIn }
+                            }
+                        },
+                        { $group: { _id: "$roomNo" } }
+                    ]
+                }
+            }
+        ]).toArray()
+    ])
 
-        availableRoomCount++
-    }
+    // Build sets of unavailable room numbers
+    const oooRoomNos = new Set(oooResult.map(d => d._id))
+    const bookedRoomNos = new Set([
+        ...(bookedResult[0]?.fromRoomsArray || []).map(d => d._id),
+        ...(bookedResult[0]?.fromRootLevel || []).map(d => d._id)
+    ])
+
+    const availableRoomCount = cleanRoomNumbers.filter(
+        roomNo => !oooRoomNos.has(roomNo) && !bookedRoomNos.has(roomNo)
+    ).length
 
     if (availableRoomCount > 0) {
         res.send({
