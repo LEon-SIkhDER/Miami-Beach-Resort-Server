@@ -185,6 +185,16 @@ const ensureBookingIdIndex = async (bookingCollection) => {
     if (!roomCheckOutIndex) {
         await bookingCollection.createIndex({ "rooms.checkOut": 1 })
     }
+
+    const createdAtIndex = indexes.find(index => index.key?.createdAt === 1)
+    if (!createdAtIndex) {
+        await bookingCollection.createIndex({ createdAt: 1 })
+    }
+
+    const cancelledAtIndex = indexes.find(index => index.key?.cancelledAt === 1)
+    if (!cancelledAtIndex) {
+        await bookingCollection.createIndex({ cancelledAt: 1 })
+    }
 }
 
 const toObjectId = (value) => {
@@ -3207,96 +3217,292 @@ app.delete("/settings/extra-services/billing-types/:id", verifyFBToken, verifyAd
 
 // ADMIN OVERVIEW & INCOME ..............................................
 app.get("/admin/overview", verifyFBToken, verifyAdmin, async (req, res) => {
-    const now = new Date()
-    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
-    const currentMonthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999)
+    try {
+        const now = new Date()
+        const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+        const currentMonthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999)
 
-    const dataFromBookings = (await bookingCollection.aggregate([{
-        $facet: {
-            statusCounts: [
-                { $group: { _id: "$status", count: { $sum: 1 } } }
-            ],
-            bookingsPerDay: [
-                {
-                    $group: {
-                        _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-                        count: { $sum: 1 }
-                    }
-                },
-                { $sort: { _id: 1 } },
-                { $limit: 7 }
-            ]
-        }
-    }]).toArray())[0]
+        const CONFIRMED = ["booking_confirmed", "checked_id", "checked_in", "checked_out", "confirmed"]
+        const CANCELLED = ["cancel", "cancelled"]
 
-    const allBookings = await bookingCollection.find().toArray()
-    const hydratedBookings = await hydrateBookingsWithRooms(allBookings, roomCollection, categoryAndRoomCollection)
-    const revenueBookings = hydratedBookings.filter(isRevenueBooking)
-    const totalRevenue = revenueBookings.reduce((total, booking) => total + getBookingRevenue(booking), 0)
+        // Single aggregation — all metrics computed inside MongoDB, no full-collection JS hydration
+        const [facetResult] = await bookingCollection.aggregate([
+            {
+                $facet: {
+                    // 1. Status counts for totalBookings / confirmed / pending / cancelled cards
+                    statusCounts: [
+                        { $group: { _id: "$status", count: { $sum: 1 } } }
+                    ],
 
-    const monthlyRevenueBookings = revenueBookings.filter(booking => {
-        const bookingDate = booking.cancelledAt ? new Date(booking.cancelledAt) : (booking.createdAt ? new Date(booking.createdAt) : null)
-        if (bookingDate && bookingDate >= currentMonthStart && bookingDate <= currentMonthEnd) return true
-        const firstRoom = getBookingRooms(booking)[0]
-        if (firstRoom?.checkIn) {
-            const cIn = new Date(firstRoom.checkIn)
-            if (cIn >= currentMonthStart && cIn <= currentMonthEnd) return true
-        }
-        return false
-    })
-    const monthlyRevenue = monthlyRevenueBookings.reduce((total, booking) => total + getBookingRevenue(booking), 0)
+                    // 2. Last 7 distinct date buckets (newest first, then reversed to ascending)
+                    bookingsPerDay: [
+                        {
+                            $group: {
+                                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { _id: -1 } },
+                        { $limit: 7 },
+                        { $sort: { _id: 1 } }
+                    ],
 
-    const roomCountMap = {}
-    const roomRevenueMap = {}
+                    // 3. All-time total revenue
+                    //    Confirmed: rooms[].pricePerNight * rooms[].nights - discountAmount
+                    //    Cancelled with payment: paidAmount
+                    totalRevenue: [
+                        {
+                            $match: {
+                                $or: [
+                                    { status: { $in: CONFIRMED } },
+                                    { status: { $in: CANCELLED }, paidAmount: { $gt: 0 } }
+                                ]
+                            }
+                        },
+                        {
+                            $project: {
+                                status: 1,
+                                paidAmount: { $ifNull: ["$paidAmount", 0] },
+                                discountAmount: { $ifNull: ["$discountAmount", { $ifNull: ["$discount", 0] }] },
+                                extraServiceCost: { $ifNull: ["$extraServiceCost", 0] },
+                                // Sum pricePerNight*nights across rooms array; fall back to legacy flat fields
+                                roomSubtotal: {
+                                    $cond: [
+                                        {
+                                            $and: [
+                                                { $isArray: "$rooms" },
+                                                { $gt: [{ $size: { $ifNull: ["$rooms", []] } }, 0] }
+                                            ]
+                                        },
+                                        {
+                                            $reduce: {
+                                                input: "$rooms",
+                                                initialValue: 0,
+                                                in: {
+                                                    $add: [
+                                                        "$$value",
+                                                        {
+                                                            $multiply: [
+                                                                { $ifNull: ["$$this.pricePerNight", 0] },
+                                                                { $max: [{ $ifNull: ["$$this.nights", 0] }, 0] }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        },
+                                        // Legacy flat doc
+                                        {
+                                            $multiply: [
+                                                { $ifNull: ["$pricePerNight", 0] },
+                                                { $max: [{ $ifNull: ["$nights", 0] }, 0] }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $project: {
+                                revenue: {
+                                    $cond: [
+                                        { $in: ["$status", CANCELLED] },
+                                        "$paidAmount",
+                                        {
+                                            $max: [
+                                                {
+                                                    $subtract: [
+                                                        { $add: ["$roomSubtotal", "$extraServiceCost"] },
+                                                        "$discountAmount"
+                                                    ]
+                                                },
+                                                0
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        { $group: { _id: null, total: { $sum: "$revenue" } } }
+                    ],
 
-    revenueBookings.forEach(booking => {
-        const isCancelled = CANCEL_STATUSES.includes(booking.status)
-        const rooms = getBookingRooms(booking)
-        if (!rooms.length) return
+                    // 4. Monthly revenue — same logic filtered to current month's createdAt or cancelledAt
+                    monthlyRevenue: [
+                        {
+                            $match: {
+                                $and: [
+                                    {
+                                        $or: [
+                                            { status: { $in: CONFIRMED } },
+                                            { status: { $in: CANCELLED }, paidAmount: { $gt: 0 } }
+                                        ]
+                                    },
+                                    {
+                                        $or: [
+                                            { createdAt: { $gte: currentMonthStart, $lte: currentMonthEnd } },
+                                            { cancelledAt: { $gte: currentMonthStart, $lte: currentMonthEnd } }
+                                        ]
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            $project: {
+                                status: 1,
+                                paidAmount: { $ifNull: ["$paidAmount", 0] },
+                                discountAmount: { $ifNull: ["$discountAmount", { $ifNull: ["$discount", 0] }] },
+                                extraServiceCost: { $ifNull: ["$extraServiceCost", 0] },
+                                roomSubtotal: {
+                                    $cond: [
+                                        {
+                                            $and: [
+                                                { $isArray: "$rooms" },
+                                                { $gt: [{ $size: { $ifNull: ["$rooms", []] } }, 0] }
+                                            ]
+                                        },
+                                        {
+                                            $reduce: {
+                                                input: "$rooms",
+                                                initialValue: 0,
+                                                in: {
+                                                    $add: [
+                                                        "$$value",
+                                                        {
+                                                            $multiply: [
+                                                                { $ifNull: ["$$this.pricePerNight", 0] },
+                                                                { $max: [{ $ifNull: ["$$this.nights", 0] }, 0] }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        },
+                                        {
+                                            $multiply: [
+                                                { $ifNull: ["$pricePerNight", 0] },
+                                                { $max: [{ $ifNull: ["$nights", 0] }, 0] }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $project: {
+                                revenue: {
+                                    $cond: [
+                                        { $in: ["$status", CANCELLED] },
+                                        "$paidAmount",
+                                        {
+                                            $max: [
+                                                {
+                                                    $subtract: [
+                                                        { $add: ["$roomSubtotal", "$extraServiceCost"] },
+                                                        "$discountAmount"
+                                                    ]
+                                                },
+                                                0
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        { $group: { _id: null, total: { $sum: "$revenue" } } }
+                    ],
 
-        if (isCancelled) {
-            const retainedPaid = Number(booking.paidAmount || 0)
-            if (retainedPaid > 0) {
-                const totalRoomPrice = rooms.reduce((sum, r) => sum + (getRoomTotal(r) || 1), 0) || 1
-                rooms.forEach(room => {
-                    const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
-                    const portion = ((getRoomTotal(room) || 1) / totalRoomPrice) * retainedPaid
-                    roomRevenueMap[label] = (roomRevenueMap[label] || 0) + portion
-                })
+                    // 5. Booking count per room category (confirmed bookings only, not cancelled)
+                    bookingsPerRoom: [
+                        { $match: { status: { $in: CONFIRMED } } },
+                        { $unwind: "$rooms" },
+                        {
+                            $group: {
+                                _id: {
+                                    $trim: {
+                                        input: {
+                                            $ifNull: [
+                                                "$rooms.categoryName",
+                                                { $ifNull: ["$roomName", { $ifNull: ["$roomCategory", "Room"] }] }
+                                            ]
+                                        }
+                                    }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { count: -1 } }
+                    ],
+
+                    // 6. Revenue per room category (confirmed + cancelled-with-payment)
+                    revenuePerRoom: [
+                        {
+                            $match: {
+                                $or: [
+                                    { status: { $in: CONFIRMED } },
+                                    { status: { $in: CANCELLED }, paidAmount: { $gt: 0 } }
+                                ]
+                            }
+                        },
+                        { $unwind: { path: "$rooms", preserveNullAndEmptyArrays: true } },
+                        {
+                            $group: {
+                                _id: {
+                                    $trim: {
+                                        input: {
+                                            $ifNull: [
+                                                "$rooms.categoryName",
+                                                { $ifNull: ["$roomName", { $ifNull: ["$roomCategory", "Room"] }] }
+                                            ]
+                                        }
+                                    }
+                                },
+                                revenue: {
+                                    $sum: {
+                                        $cond: [
+                                            { $in: ["$status", CANCELLED] },
+                                            { $ifNull: ["$paidAmount", 0] },
+                                            {
+                                                $max: [
+                                                    {
+                                                        $multiply: [
+                                                            { $ifNull: ["$rooms.pricePerNight", 0] },
+                                                            { $max: [{ $ifNull: ["$rooms.nights", 0] }, 0] }
+                                                        ]
+                                                    },
+                                                    0
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        { $sort: { revenue: -1 } }
+                    ]
+                }
             }
-        } else {
-            rooms.forEach(room => {
-                const label = room.room?.name || room.room?.category || room.categoryName || room.roomName || room.roomCategory || "Room"
-                roomCountMap[label] = (roomCountMap[label] || 0) + 1
-                roomRevenueMap[label] = (roomRevenueMap[label] || 0) + getRoomTotal(room)
-            })
+        ], { allowDiskUse: true }).toArray()
+
+        const statusMap = {}
+        facetResult.statusCounts.forEach(s => { statusMap[s._id] = s.count })
+
+        const result = {
+            totalBookings: Object.values(statusMap).reduce((t, c) => t + c, 0),
+            confirmedCount: (statusMap.booking_confirmed || 0) + (statusMap.checked_id || 0) + (statusMap.checked_out || 0) + (statusMap.confirmed || 0),
+            pendingCount: (statusMap.request_booking || 0) + (statusMap.pending || 0),
+            cancelledCount: (statusMap.cancel || 0) + (statusMap.cancelled || 0),
+            totalRevenue: facetResult.totalRevenue[0]?.total || 0,
+            monthlyRevenue: facetResult.monthlyRevenue[0]?.total || 0,
+            currentMonthName: now.toLocaleString('default', { month: 'long', year: 'numeric' }),
+            bookingsPerDay: facetResult.bookingsPerDay,
+            bookingsPerRoom: facetResult.bookingsPerRoom.map(r => ({ _id: r._id, count: r.count })),
+            revenuePerRoom: facetResult.revenuePerRoom.map(r => ({ roomName: r._id, revenue: r.revenue }))
         }
-    })
-
-    const bookingsPerRoom = Object.entries(roomCountMap)
-        .map(([roomName, count]) => ({ _id: roomName, count }))
-        .sort((a, b) => b.count - a.count)
-
-    const revenuePerRoom = Object.entries(roomRevenueMap)
-        .map(([roomName, revenue]) => ({ roomName, revenue }))
-        .sort((a, b) => b.revenue - a.revenue)
-
-    const statusMap = {}
-    dataFromBookings.statusCounts.forEach(s => { statusMap[s._id] = s.count })
-
-    const result = {
-        totalBookings: Object.values(statusMap).reduce((total, count) => total + count, 0),
-        confirmedCount: (statusMap.booking_confirmed || 0) + (statusMap.checked_id || 0) + (statusMap.checked_out || 0) + (statusMap.confirmed || 0),
-        pendingCount: (statusMap.request_booking || 0) + (statusMap.pending || 0),
-        cancelledCount: (statusMap.cancel || 0) + (statusMap.cancelled || 0),
-        totalRevenue,
-        monthlyRevenue,
-        currentMonthName: now.toLocaleString('default', { month: 'long', year: 'numeric' }),
-        bookingsPerDay: dataFromBookings.bookingsPerDay,
-        bookingsPerRoom,
-        revenuePerRoom
+        res.send(result)
+    } catch (err) {
+        console.error('Admin overview error:', err)
+        res.status(500).send({ message: 'Failed to load admin overview' })
     }
-    res.send(result)
 })
 
 // Detailed Income Analytics (Supports Server-Side Pagination with limit & skip, powered by MongoDB Aggregation)
