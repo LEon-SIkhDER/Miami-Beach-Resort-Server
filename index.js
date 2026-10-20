@@ -1758,7 +1758,7 @@ function detectBookingChanges(oldDoc, updatePayload) {
         }
     }
 
-    // 3. Pricing & Financials
+    // 3. Pricing & Financial
     const oldTotal = normalizeNum(oldDoc.totalAmount) || 0
     const newTotal = normalizeNum(updatePayload.totalAmount)
     if (newTotal !== null && Math.abs(oldTotal - newTotal) > 0.01) {
@@ -2288,7 +2288,7 @@ app.get("/booking/:id/reservation-voucher", verifyFBToken, async (req, res) => {
         const roomRows = rawRooms.map(r => {
             const checkIn = r.checkIn || booking.checkIn
             const checkOut = r.checkOut || booking.checkOut
-            let nights = 1
+            let nights = Number(r.nights) || 1
             if (checkIn && checkOut) {
                 const start = new Date(checkIn)
                 const end = new Date(checkOut)
@@ -2317,7 +2317,7 @@ app.get("/booking/:id/reservation-voucher", verifyFBToken, async (req, res) => {
 
         const totalAdults = rawRooms.reduce((sum, r) => sum + Number(r.adults || 1), 0)
         const totalChildren = rawRooms.reduce((sum, r) => sum + Number(r.babies || 0), 0)
-        const totalNights = roomRows.reduce((sum, r) => Math.max(sum, r.roomNights), 0)
+        const totalNights = roomRows.reduce((sum, r) => sum + Number(r.roomNights || 1), 0)
 
         const creator = booking.reference || booking.changedBy?.name || "Front Desk"
 
