@@ -2317,7 +2317,80 @@ app.get("/booking/:id/reservation-voucher", verifyFBToken, async (req, res) => {
 
         const totalAdults = rawRooms.reduce((sum, r) => sum + Number(r.adults || 1), 0)
         const totalChildren = rawRooms.reduce((sum, r) => sum + Number(r.babies || 0), 0)
-        const totalNights = roomRows.reduce((sum, r) => sum + Number(r.roomNights || 1), 0)
+        // Helper to normalize dates for grouping comparison (YYYY-MM-DD)
+        const normalizeDateForVoucher = (d) => {
+            if (!d) return ""
+            try {
+                const parsed = typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)
+                    ? new Date(`${d}T00:00:00`)
+                    : new Date(d)
+                if (!isNaN(parsed.getTime())) {
+                    const y = parsed.getFullYear()
+                    const m = String(parsed.getMonth() + 1).padStart(2, "0")
+                    const day = String(parsed.getDate()).padStart(2, "0")
+                    return `${y}-${m}-${day}`
+                }
+            } catch (e) {}
+            return String(d).trim().split("T")[0]
+        }
+
+        // Group rooms if room category type and dates (check-in, check-out) are identical
+        const groupedRoomMap = new Map()
+        roomRows.forEach(r => {
+            const catKey = String(r.roomType || "").trim().toLowerCase()
+            const inKey = normalizeDateForVoucher(r.arrivalDate)
+            const outKey = normalizeDateForVoucher(r.departureDate)
+            const groupKey = `${catKey}__${inKey}__${outKey}`
+
+            const rNos = []
+            if (r.roomNo) {
+                String(r.roomNo).split(",").map(s => s.trim()).filter(Boolean).forEach(num => {
+                    if (!rNos.includes(num)) rNos.push(num)
+                })
+            }
+
+            if (!groupedRoomMap.has(groupKey)) {
+                groupedRoomMap.set(groupKey, {
+                    roomType: r.roomType,
+                    roomNos: rNos,
+                    arrivalDate: r.arrivalDate,
+                    departureDate: r.departureDate,
+                    roomNights: r.roomNights,
+                    roomQty: Number(r.roomQty || 1),
+                    total: Number(r.total || 0),
+                    roomTariff: Number(r.roomTariff || 0)
+                })
+            } else {
+                const existing = groupedRoomMap.get(groupKey)
+                existing.roomQty += Number(r.roomQty || 1)
+                existing.total += Number(r.total || 0)
+                rNos.forEach(num => {
+                    if (!existing.roomNos.includes(num)) {
+                        existing.roomNos.push(num)
+                    }
+                })
+            }
+        })
+
+        const finalRoomRows = Array.from(groupedRoomMap.values()).map(g => {
+            const totalRoomNights = Number(g.roomNights || 1) * Number(g.roomQty || 1)
+            const effectiveTariff = (totalRoomNights > 0 && g.total > 0)
+                ? (g.total / totalRoomNights)
+                : Number(g.roomTariff || 0)
+
+            return {
+                roomType: g.roomType,
+                roomNo: g.roomNos.length > 0 ? g.roomNos.join(", ") : (booking.roomNo || ""),
+                arrivalDate: g.arrivalDate,
+                departureDate: g.departureDate,
+                roomTariff: effectiveTariff,
+                roomQty: g.roomQty,
+                roomNights: g.roomNights,
+                total: g.total
+            }
+        })
+
+        const totalNights = finalRoomRows.reduce((sum, r) => sum + (Number(r.roomQty || 1) * Number(r.roomNights || 1)), 0)
 
         const creator = booking.reference || booking.changedBy?.name || "Front Desk"
 
@@ -2359,7 +2432,7 @@ app.get("/booking/:id/reservation-voucher", verifyFBToken, async (req, res) => {
                     airportDrop: "NO",
                     flightEtd: ""
                 },
-                rooms: roomRows,
+                rooms: finalRoomRows,
                 financials: {
                     totalAmount: payableTotal,
                     paidAmount,
